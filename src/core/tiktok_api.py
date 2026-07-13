@@ -163,6 +163,34 @@ class TikTokAPI:
 
         return f"{self.BASE_URL}{signed_path}"
 
+    def _direct_get_room_id_from_user(self, user: str) -> str | None:
+        """Resolve a room_id straight from TikTok's public api-live endpoint,
+        skipping the tikrec signing hop.
+
+        Used as a fallback when tikrec is unavailable. This endpoint currently
+        answers *unsigned* (no X-Bogus/_signature needed), which is why it works
+        as a drop-in — but it is more prone to WAF "Please wait" challenges under
+        heavy automated polling from a datacenter IP, so it stays a fallback
+        rather than the primary path. It returns a roomId even when the user is
+        offline (liveness is decided separately by is_room_alive), matching the
+        tikrec path's contract.
+        """
+        response = self.http_client.get(
+            self.API_URL,
+            params={"aid": "1988", "sourceType": "54", "uniqueId": user},
+        )
+        content = response.text
+
+        if not content or "Please wait" in content:
+            raise UserLiveError(TikTokError.WAF_BLOCKED)
+
+        try:
+            data = response.json()
+        except ValueError as e:
+            raise UserLiveError(TikTokError.ROOM_ID_ERROR) from e
+
+        return (data.get("data") or {}).get("user", {}).get("roomId")
+
     def get_room_id_from_user(self, user: str) -> str | None:
         """Given a username, get the room_id."""
         try:
@@ -170,9 +198,10 @@ class TikTokAPI:
         except TikRecUnavailableError as e:
             logger.warning(
                 f"[!] tikrec is unavailable ({e}). "
-                "Falling back to unsigned API — recording continues but may be less reliable."
+                "Falling back to the direct TikTok api-live endpoint — recording "
+                "continues but may be more WAF-prone under heavy load."
             )
-            return self._old_get_room_id_from_user(user)
+            return self._direct_get_room_id_from_user(user)
 
         response = self.http_client.get(signed_url)
         content = response.text
