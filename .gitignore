@@ -139,3 +139,10 @@ dmypy.json
 .DS_Store
 
 .idea/
+
+# Runtime state written by tiktak, not source (see §37).
+# users.txt is the live watch-list: it is overwritten on prod with the real
+# account list, so tracking it would dirty the tree and block git pull — and
+# this repo is PUBLIC.
+users.txt
+stop_now.txt
