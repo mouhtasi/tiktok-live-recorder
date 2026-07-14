@@ -109,8 +109,22 @@ class TikTokRecorder:
                 )
                 time.sleep(self.automatic_interval * TimeOut.ONE_MINUTE)
 
-            except (ConnectionError, RequestException, HTTPException):
-                logger.error(Error.CONNECTION_CLOSED_AUTOMATIC)
+            except Exception as ex:
+                # Any other error during the poll/record cycle is transient from
+                # the monitor's point of view and must NOT escape this loop. In
+                # multi-user automatic mode each user runs in its own process
+                # (see main.run_recordings) and the parent only joins children —
+                # it never respawns a dead one. So an uncaught exception here
+                # silently stops monitoring this user until the entire recorder
+                # is restarted. The previous handler caught only (ConnectionError,
+                # RequestException, HTTPException), which still misses curl_cffi
+                # transport errors (the is_room_alive path uses curl_cffi, whose
+                # exceptions don't derive from requests.RequestException),
+                # JSON-decode errors, etc. Catch broadly, log, and retry.
+                logger.error(
+                    f"Recoverable error in automatic mode for @{self.user}, "
+                    f"retrying after delay: {ex}"
+                )
                 time.sleep(TimeOut.CONNECTION_CLOSED * TimeOut.ONE_MINUTE)
 
     def followers_mode(self):
