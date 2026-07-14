@@ -29,6 +29,16 @@ class TikTokRecorder:
         self.use_telegram = config.use_telegram
         self._proxy = config.proxy
         self._cookies = config.cookies
+        self._stop_event = config.stop_event
+        self._stop_now_event = config.stop_now_event
+
+    def should_stop(self) -> bool:
+        """Retire this monitor at the next poll boundary (never mid-recording)."""
+        return self._stop_event is not None and self._stop_event.is_set()
+
+    def should_stop_now(self) -> bool:
+        """End the *current recording* immediately (but still finalize it)."""
+        return self._stop_now_event is not None and self._stop_now_event.is_set()
 
     def _setup(self):
         """Resolve user/room data and validate prerequisites via network calls."""
@@ -97,7 +107,10 @@ class TikTokRecorder:
         self.start_recording(self.user, self.room_id)
 
     def automatic_mode(self):
-        while True:
+        # The stop flag is read HERE, at the poll boundary — never inside
+        # start_recording(), which blocks for the whole broadcast. So a monitor
+        # told to stop mid-stream finishes writing its file and exits after.
+        while not self.should_stop():
             try:
                 self.room_id = self.tiktok.get_room_id_from_user(self.user)
                 self.manual_mode()
@@ -126,6 +139,8 @@ class TikTokRecorder:
                     f"retrying after delay: {ex}"
                 )
                 time.sleep(TimeOut.CONNECTION_CLOSED * TimeOut.ONE_MINUTE)
+
+        logger.info(f"Monitor for @{self.user} stopping as requested.")
 
     def followers_mode(self):
         active_recordings = {}  # follower -> Thread
@@ -230,6 +245,20 @@ class TikTokRecorder:
                             out_file.write(buffer)
                             buffer.clear()
 
+                        # Force-stop: break out of the download loop rather than
+                        # being killed. Falling through leaves the `finally` to
+                        # flush, the `with` to close, and convert_flv_to_mp4() to
+                        # run — so the partial recording is kept and is a real
+                        # mp4. A SIGKILL here would instead leave raw FLV bytes
+                        # under a .mp4 name for ingest to misfile.
+                        if self.should_stop_now():
+                            logger.info(
+                                f"Stop requested for @{user} — ending the recording "
+                                "now and converting what we have."
+                            )
+                            stop_recording = True
+                            break
+
                         elapsed_time = time.time() - start_time
                         if self.duration and elapsed_time >= self.duration:
                             stop_recording = True
@@ -260,6 +289,12 @@ class TikTokRecorder:
                         out_file.write(buffer)
                         buffer.clear()
                     out_file.flush()
+
+        # A force-stop is one-shot: it ends *this* recording. If the user is
+        # still in the watch-list, the monitor keeps polling — without this the
+        # flag would cut every future recording too.
+        if self._stop_now_event is not None:
+            self._stop_now_event.clear()
 
         logger.info(f"Recording finished: {Path(output).resolve()}\n")
         VideoManagement.convert_flv_to_mp4(output, self.bitrate, self.ffmpeg_path)

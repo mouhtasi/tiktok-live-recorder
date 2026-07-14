@@ -107,6 +107,32 @@ def parse_args():
     )
 
     parser.add_argument(
+        "-watchlist",
+        dest="watchlist",
+        default=None,
+        action="store",
+        help=(
+            "Path to a watch-list file (one username per line) to supervise in "
+            "automatic mode. The recorder keeps one monitor process per listed "
+            "user, re-reading the file on SIGHUP and on a timer, so users can be "
+            "added or removed WITHOUT restarting the recorder (which would "
+            "truncate every recording in flight). Replaces -user."
+        ),
+    )
+
+    parser.add_argument(
+        "-stop-now-file",
+        dest="stop_now_file",
+        default=None,
+        action="store",
+        help=(
+            "Path to a force-stop command file (one username per line), consumed "
+            "on read. Ends those users' CURRENT recordings immediately — the file "
+            "is still flushed and converted, it is not a kill. Requires -watchlist."
+        ),
+    )
+
+    parser.add_argument(
         "-no-update-check",
         dest="update_check",
         action="store_false",
@@ -133,8 +159,20 @@ def validate_and_parse_args():
             "Incorrect mode value. Choose between 'manual', 'automatic' or 'followers'."
         )
 
+    if args.watchlist and args.mode != "automatic":
+        raise ArgsParseError("-watchlist is only supported in automatic mode.")
+
+    if args.watchlist and args.user:
+        raise ArgsParseError(
+            "Provide either -user or -watchlist, not both: the watch-list file is "
+            "the source of truth for who is monitored."
+        )
+
+    if args.stop_now_file and not args.watchlist:
+        raise ArgsParseError("-stop-now-file requires -watchlist.")
+
     if args.mode in ["manual", "automatic"]:
-        if not args.user and not args.room_id and not args.url:
+        if not args.user and not args.room_id and not args.url and not args.watchlist:
             raise ArgsParseError(
                 "Missing URL, username, or room ID. Please provide one of these parameters."
             )
