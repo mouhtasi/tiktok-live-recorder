@@ -44,7 +44,12 @@ def _make_recorder(should_stop=None, interval=5, user="tester"):
     rec.user = user
     rec.automatic_interval = interval
     rec.tiktok = Mock()
+    rec._stop_event = None
+    rec._stop_now_event = None
+    # Override the predicates directly — the events themselves are exercised in
+    # the supervisor's integration path, not here.
     rec.should_stop = should_stop or (lambda: False)
+    rec.should_stop_now = lambda: False
     return rec
 
 

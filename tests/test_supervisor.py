@@ -62,10 +62,19 @@ class FakeWorker:
     def is_alive(self):
         return self._alive
 
-    def request_stop(self, force=False):
+    def request_stop(self):
+        """Graceful: exit at the next poll boundary, finishing any recording."""
         self.stop_requested = True
-        if force:
-            self.force_stopped = True
+
+    def stop_recording_now(self):
+        """Cut the *current recording* short (but still flush + convert it).
+
+        Deliberately separate from request_stop(): "stop watching @a" and "end
+        @a's current recording" are orthogonal. Conflating them means a force-stop
+        on a user who is still in the watch-list would also make their monitor
+        exit — and it would then be respawned, recording them again.
+        """
+        self.force_stopped = True
 
     def join(self, timeout=None):
         self.joined = True
