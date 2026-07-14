@@ -191,17 +191,16 @@ class TikTokAPI:
 
         return (data.get("data") or {}).get("user", {}).get("roomId")
 
-    def get_room_id_from_user(self, user: str) -> str | None:
-        """Given a username, get the room_id."""
-        try:
-            signed_url = self._tikrec_get_room_id_signed_url(user)
-        except TikRecUnavailableError as e:
-            logger.warning(
-                f"[!] tikrec is unavailable ({e}). "
-                "Falling back to the direct TikTok api-live endpoint — recording "
-                "continues but may be more WAF-prone under heavy load."
-            )
-            return self._direct_get_room_id_from_user(user)
+    def _signed_get_room_id_from_user(self, user: str) -> str | None:
+        """Resolve a room_id through the tikrec-signed URL (the primary path).
+
+        Raises TikRecUnavailableError if the tikrec path fails to produce a
+        usable answer — including when the *signed fetch* comes back non-JSON,
+        which means the signed URL itself was bad, not that TikTok is down. A
+        WAF block is a different thing (our IP, not tikrec) and propagates as
+        UserLiveError.
+        """
+        signed_url = self._tikrec_get_room_id_signed_url(user)
 
         response = self.http_client.get(signed_url)
         content = response.text
@@ -209,8 +208,46 @@ class TikTokAPI:
         if not content or "Please wait" in content:
             raise UserLiveError(TikTokError.WAF_BLOCKED)
 
-        data = response.json()
+        try:
+            data = response.json()
+        except ValueError as e:
+            raise TikRecUnavailableError(
+                "tikrec's signed URL returned an invalid response "
+                "(expected JSON, got something else)."
+            ) from e
+
         return (data.get("data") or {}).get("user", {}).get("roomId")
+
+    def get_room_id_from_user(self, user: str) -> str | None:
+        """Given a username, get the room_id.
+
+        Primary path is the tikrec signing service. tikrec is a free third-party
+        SPOF that has taken all recording down before (Cloudflare 522, 2026-07-12),
+        so *any* failure to resolve a room_id through it — unreachable, junk
+        response, no signed_path, or a signed fetch that yields no roomId — falls
+        back to TikTok's public api-live endpoint, which currently answers
+        unsigned. The fallback is more WAF-prone under heavy automated load, so
+        it stays a fallback rather than the primary path.
+
+        Note this deliberately does NOT use upstream's _old_get_room_id_from_user():
+        that calls eulerstream with an empty API key and answers HTTP 401
+        ("requires the Webcast Premium add-on"), so as a fallback it is a no-op
+        that would leave us blind exactly when tikrec is down.
+        """
+        try:
+            room_id = self._signed_get_room_id_from_user(user)
+            if room_id:
+                return room_id
+            reason = "tikrec resolved no roomId for this user"
+        except TikRecUnavailableError as e:
+            reason = str(e)
+
+        logger.warning(
+            f"[!] tikrec did not resolve a room-id for @{user} ({reason}). "
+            "Falling back to the direct TikTok api-live endpoint — recording "
+            "continues but may be more WAF-prone under heavy load."
+        )
+        return self._direct_get_room_id_from_user(user)
 
     def get_followers_list(self, sec_uid) -> list:
         """
