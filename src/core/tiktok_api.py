@@ -39,13 +39,13 @@ class TikTokAPI:
 
         return response.status_code == StatusCode.REDIRECT
 
-    def is_room_alive(self, room_id: str) -> bool:
-        """
-        Checking whether the user is live.
-        """
-        if not room_id:
-            raise UserLiveError(TikTokError.USER_NOT_CURRENTLY_LIVE)
+    def _check_alive_flag(self, room_id: str) -> bool:
+        """The legacy liveness probe: webcast/room/check_alive's `alive` flag.
 
+        Kept ONLY as a WAF-time fallback for is_room_alive(). As of 2026-07-15
+        this flag is unreliable on its own — TikTok returns alive:true for
+        long-ended rooms (room status 4) — so it must never be the sole signal.
+        """
         data = self.http_client.get(
             f"{self.WEBCAST_URL}/webcast/room/check_alive/"
             f"?aid=1988&region=CH&room_ids={room_id}&user_is_login=true"
@@ -55,6 +55,35 @@ class TikTokAPI:
             return False
 
         return data["data"][0].get("alive", False)
+
+    def is_room_alive(self, room_id: str) -> bool:
+        """Return True only if the room is CURRENTLY broadcasting.
+
+        Liveness is decided by room/info's `status` field (2 == ongoing/live,
+        4 == ended), NOT by webcast/room/check_alive's `alive` flag. On
+        2026-07-15 that flag began answering alive:true for rooms that had
+        ENDED months earlier (e.g. a room created 2025-04-05, status 4). Because
+        get_room_id_from_user() deliberately returns an offline user's *last*
+        room_id, trusting `alive` made the recorder start phantom recordings of
+        stale rooms — writing keepalive `pong` frames to disk forever and
+        reporting every watched account as "live". room `status` cleanly
+        separates a genuine live (2) from every stale room (4).
+
+        Under a WAF challenge (status_code 4003110) room/info can't give us a
+        status; we fall back to the legacy `alive` flag so get_live_url()'s
+        page-scrape WAF path can still fire, rather than newly going blind.
+        """
+        if not room_id:
+            raise UserLiveError(TikTokError.USER_NOT_CURRENTLY_LIVE)
+
+        data = self.http_client.get(
+            f"{self.WEBCAST_URL}/webcast/room/info/?aid=1988&room_id={room_id}"
+        ).json()
+
+        if data.get("status_code") == 4003110:  # WAF block — no status available
+            return self._check_alive_flag(room_id)
+
+        return (data.get("data") or {}).get("status") == 2
 
     def get_sec_uid(self):
         """
