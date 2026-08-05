@@ -24,3 +24,6 @@ class RecorderConfig:
     # has. Neither is a kill.
     stop_event: object | None = None
     stop_now_event: object | None = None
+    # The watch-list this monitor re-reads its own poll interval from (§58). None
+    # in single-user runs, which just use `automatic_interval`.
+    watchlist_path: str | None = None

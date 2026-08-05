@@ -46,6 +46,10 @@ def _make_recorder(should_stop=None, interval=5, user="tester"):
     rec.tiktok = Mock()
     rec._stop_event = None
     rec._stop_now_event = None
+    # No watch-list, so _poll_interval_minutes() resolves to `automatic_interval`
+    # and these tests keep asserting on the global default. §58's per-account
+    # tiering is covered in test_adaptive_poll_interval.py.
+    rec.watchlist_path = None
     # Override the predicates directly — the events themselves are exercised in
     # the supervisor's integration path, not here.
     rec.should_stop = should_stop or (lambda: False)

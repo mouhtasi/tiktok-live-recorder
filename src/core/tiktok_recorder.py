@@ -5,6 +5,7 @@ from threading import Thread
 
 from requests import RequestException
 
+from core.supervisor import read_watchlist_entries
 from core.tiktok_api import TikTokAPI
 from utils.logger_manager import logger
 from utils.recorder_config import RecorderConfig
@@ -22,6 +23,11 @@ class TikTokRecorder:
         self.room_id = config.room_id
         self.mode = config.mode
         self.automatic_interval = config.automatic_interval
+        # Where to look up *this* monitor's own recheck interval (§58). Re-read at
+        # every poll boundary rather than fixed here, so re-tiering an account
+        # lands without respawning its monitor — a respawn truncates whatever it
+        # is recording.
+        self.watchlist_path = config.watchlist_path
         self.duration = config.duration
         self.output = config.output
         self.bitrate = config.bitrate
@@ -39,6 +45,54 @@ class TikTokRecorder:
     def should_stop_now(self) -> bool:
         """End the *current recording* immediately (but still finalize it)."""
         return self._stop_now_event is not None and self._stop_now_event.is_set()
+
+    def _poll_interval_minutes(self) -> int:
+        """This monitor's recheck interval, re-read from the watch-list (§58).
+
+        tiktak tiers accounts by their live history — 5 minutes for the 17 that
+        actually stream, 60 for the 81 that never have — and publishes the number
+        in the watch-list, because the tier is derived from a `lives` table this
+        repo cannot and should not see. We only obey the number.
+
+        🚨 **Every failure resolves to the configured default, never slower.** A
+        missing file, a garbled row, an account not listed, a filesystem blip: all
+        of them mean "no instruction", and the safe reading of no instruction is
+        the normal poll rate. Biasing the other way would silently park a real
+        streamer on an hourly poll, and a live we did not poll for is gone — there
+        is no equivalent of re-walking a page to pick it up later.
+        """
+        if not self.watchlist_path:
+            return self.automatic_interval
+        try:
+            for entry in read_watchlist_entries(self.watchlist_path):
+                if entry.username == self.user:
+                    return entry.interval_min or self.automatic_interval
+        except (OSError, ValueError):
+            # Includes FileNotFoundError. The supervisor treats a missing
+            # watch-list as "change nothing"; for a monitor the equivalent is
+            # "keep polling as before".
+            return self.automatic_interval
+        # Listed nowhere: this monitor is mid-retirement. Keep it at the default
+        # until it actually exits rather than changing its rate on the way out.
+        return self.automatic_interval
+
+    def _wait_for_next_poll(self, seconds: float) -> None:
+        """Wait out the recheck delay, but wake at once if asked to retire.
+
+        🚨 This must not be a bare `time.sleep`. `automatic_mode()` reads the stop
+        flag only at the loop top, so a plain sleep makes a cooperative stop (§37,
+        de-listing an account) take up to a full interval to land. At the old
+        global 5 minutes that was invisible; at §58's 60-minute cold tier it would
+        leave a retiring monitor alive for an hour, with the status page showing
+        "1 retiring" the whole time — §38b's cry-wolf failure, on a routine
+        opt-out.
+
+        Unsupervised runs (single-user manual mode) have no event and still sleep.
+        """
+        if self._stop_event is not None:
+            self._stop_event.wait(seconds)
+        else:
+            time.sleep(seconds)
 
     def _setup(self):
         """Resolve user/room data and validate prerequisites via network calls."""
@@ -117,10 +171,9 @@ class TikTokRecorder:
 
             except (UserLiveError, LiveNotFound) as ex:
                 logger.info(ex)
-                logger.info(
-                    f"Waiting {self.automatic_interval} minutes before recheck\n"
-                )
-                time.sleep(self.automatic_interval * TimeOut.ONE_MINUTE)
+                interval = self._poll_interval_minutes()
+                logger.info(f"Waiting {interval} minutes before recheck\n")
+                self._wait_for_next_poll(interval * TimeOut.ONE_MINUTE)
 
             except Exception as ex:
                 # Any other error during the poll/record cycle is transient from

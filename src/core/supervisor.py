@@ -29,11 +29,53 @@ from pathlib import Path
 from utils.logger_manager import logger
 
 
-def read_watchlist(path) -> list[str]:
-    """Parse a watch-list file: one username per line.
+@dataclass(frozen=True)
+class WatchEntry:
+    """One watch-list row: who to monitor, and optionally how often to poll.
+
+    `interval_min is None` means the row gave no instruction, which the monitor
+    resolves to its configured default. It is deliberately distinct from any
+    numeric value: "no opinion" and "poll hourly" must never collapse together,
+    because one of them is safe to guess and the other is not.
+    """
+
+    username: str
+    interval_min: int | None = None
+
+
+# A poll interval this long is certainly a bug in whatever wrote the file rather
+# than an instruction: a day between liveness polls would miss every broadcast.
+_MAX_INTERVAL_MIN = 24 * 60
+
+
+def _parse_interval(token: str) -> int | None:
+    """A row's interval, or None if it does not state a usable one.
+
+    Every rejection resolves to None — i.e. "use the default" — and never to a
+    slower value or an exception. The watch-list is machine-written, so junk here
+    means the *writer* has a bug, and the safe response to our own bug is to keep
+    polling at the normal rate. Zero and negatives are rejected for the same
+    reason they look tempting: they are not "poll fast", they are "spin".
+    """
+    try:
+        value = int(token)
+    except (TypeError, ValueError):
+        return None
+    if value <= 0 or value > _MAX_INTERVAL_MIN:
+        return None
+    return value
+
+
+def read_watchlist_entries(path) -> list[WatchEntry]:
+    """Parse a watch-list file: `username [interval_minutes]` per line.
 
     Blank lines, surrounding whitespace and `#` comments are ignored, and
-    duplicates collapse — a user listed twice must not get two recorders.
+    duplicates collapse — a user listed twice must not get two recorders (§29:
+    two processes recording one account double-write the file). The first row for
+    a username wins.
+
+    The interval column is optional, so a plain one-name-per-line file — every
+    version tiktak published before §58 — parses exactly as it always did.
 
     Raises FileNotFoundError if the file is absent. That is deliberate and the
     caller must not paper over it: an *empty* list means "record nobody", which
@@ -42,14 +84,35 @@ def read_watchlist(path) -> list[str]:
     """
     text = Path(path).read_text()
 
-    users: list[str] = []
+    entries: list[WatchEntry] = []
+    seen: set[str] = set()
     for line in text.splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        if line not in users:
-            users.append(line)
-    return users
+        parts = line.split()
+        username = parts[0]
+        if username in seen:
+            continue
+        seen.add(username)
+        entries.append(
+            WatchEntry(
+                username=username,
+                interval_min=_parse_interval(parts[1]) if len(parts) > 1 else None,
+            )
+        )
+    return entries
+
+
+def read_watchlist(path) -> list[str]:
+    """The watch-list as plain usernames.
+
+    Still the parser for the *stop-now command file*, which has no interval
+    column and must not grow one — "end @a's current recording" carries no
+    schedule. Keeping this signature is also what leaves §37's supervisor and its
+    tests untouched by §58.
+    """
+    return [e.username for e in read_watchlist_entries(path)]
 
 
 @dataclass

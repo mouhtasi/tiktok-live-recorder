@@ -41,6 +41,10 @@ def _build_config(args, mode, cookies, user=None):
         room_id=args.room_id,
         mode=mode,
         automatic_interval=args.automatic_interval,
+        # Set only in watch-list mode. A monitor re-reads its own §58 poll tier
+        # from this file, falling back to automatic_interval above whenever the
+        # file cannot answer for it.
+        watchlist_path=getattr(args, "watchlist", None),
         cookies=cookies,
         proxy=args.proxy,
         output=args.output,

@@ -58,6 +58,9 @@ def _make_recorder(interval=5, user="tester"):
     # No supervisor in these tests: the monitor is never asked to stop.
     rec._stop_event = None
     rec._stop_now_event = None
+    # No watch-list either, so the recheck delay stays the global
+    # `automatic_interval` these tests assert on (§58).
+    rec.watchlist_path = None
     return rec
 
 
