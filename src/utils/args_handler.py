@@ -133,6 +133,20 @@ def parse_args():
     )
 
     parser.add_argument(
+        "-events-file",
+        dest="events_file",
+        default=None,
+        action="store",
+        help=(
+            "Path to a JSON-lines file to append one line to per outbound "
+            "TikTok/tikrec HTTP request (timestamp, subsystem, endpoint, "
+            "status code, latency, username). Optional and off by default. "
+            "This process only ever appends — a downstream drain process "
+            "reads and rotates the file; nothing here truncates it."
+        ),
+    )
+
+    parser.add_argument(
         "-no-update-check",
         dest="update_check",
         action="store_false",

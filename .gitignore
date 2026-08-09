@@ -146,3 +146,8 @@ dmypy.json
 # this repo is PUBLIC.
 users.txt
 stop_now.txt
+# Request-event spool this process appends to (-events-file) and tiktak's
+# supervisor drains via atomic rename. Same reason as above: untracked
+# runtime state, would dirty the tree and block git pull.
+request_events.jsonl
+request_events.jsonl.draining
