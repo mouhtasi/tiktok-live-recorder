@@ -448,8 +448,9 @@ class TikTokAPI:
         If the API returns status code 4003110 and a username is provided,
         falls back to scraping the live page directly.
         """
-        data = self.http_client.get(
-            f"{self.WEBCAST_URL}/webcast/room/info/?aid=1988&room_id={room_id}"
+        data = self._get(
+            f"{self.WEBCAST_URL}/webcast/room/info/?aid=1988&room_id={room_id}",
+            "webcast/room/info",
         ).json()
 
         if "This account is private" in data:

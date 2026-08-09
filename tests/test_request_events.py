@@ -194,6 +194,25 @@ def test_is_room_alive_uses_recorder_liveness_subsystem(tmp_path):
     assert events[0] == {**events[0], "subsystem": "recorder-liveness", "endpoint": "webcast/room/info"}
 
 
+def test_get_live_url_uses_recorder_liveness_subsystem(tmp_path):
+    """get_live_url() hits the same webcast/room/info endpoint as
+    is_room_alive() — it fires once per broadcast start, at the highest-load
+    moment, and must be tagged the same way or that endpoint's total looks
+    complete while quietly missing exactly its busiest calls."""
+    events_file = tmp_path / "events.jsonl"
+    api = _make_api(events_file=str(events_file))
+    api.http_client.get.return_value = _Response(payload={
+        "data": {"stream_url": {}},
+    })
+
+    api.get_live_url("123", user="tester")
+
+    events = _read_events(events_file)
+    assert len(events) == 1
+    assert events[0]["subsystem"] == "recorder-liveness"
+    assert events[0]["endpoint"] == "webcast/room/info"
+
+
 def test_room_id_resolution_via_tikrec_splits_subsystems(tmp_path):
     """The happy path makes two calls: tikrec's signer (recorder-tikrec) and
     the signed fetch, which still lands on tiktok.com (recorder-liveness)."""
