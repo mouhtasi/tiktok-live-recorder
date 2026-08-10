@@ -16,7 +16,12 @@ from utils.enums import Mode, Error, TimeOut, TikTokError
 
 class TikTokRecorder:
     def __init__(self, config: RecorderConfig):
-        self.tiktok = TikTokAPI(proxy=config.proxy, cookies=config.cookies)
+        self.tiktok = TikTokAPI(
+            proxy=config.proxy,
+            cookies=config.cookies,
+            events_file=config.events_file,
+            user=config.user,
+        )
 
         self.url = config.url
         self.user = config.user

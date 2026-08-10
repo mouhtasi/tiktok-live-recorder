@@ -1,6 +1,8 @@
 import html
 import json
 import re
+import time
+from datetime import datetime, timezone
 
 from http_utils.http_client import HttpClient
 from utils.enums import StatusCode, TikTokError
@@ -14,7 +16,7 @@ from utils.custom_exceptions import (
 
 
 class TikTokAPI:
-    def __init__(self, proxy, cookies):
+    def __init__(self, proxy, cookies, *, events_file=None, user=None):
         self.BASE_URL = "https://www.tiktok.com"
         self.WEBCAST_URL = "https://webcast.tiktok.com"
         self.API_URL = "https://www.tiktok.com/api-live/user/room/"
@@ -23,6 +25,61 @@ class TikTokAPI:
 
         self.http_client = HttpClient(proxy, cookies).req
         self._http_client_stream = HttpClient(proxy, cookies).req_stream
+
+        # Optional request-event sink (tiktak's recorder instrumentation). None
+        # keeps this a no-op, so a fork without tiktak's caller behaves exactly
+        # as before. See _get()/_emit_request_event() below.
+        self._events_file = events_file
+        self._user = user
+
+    def _emit_request_event(self, subsystem, endpoint, status, latency_ms):
+        """Append one JSON line describing an outbound request, if configured.
+
+        Deliberately file-based, not a DB write: this fork stays decoupled from
+        tiktak's schema. tiktak's supervisor drains this file on its own
+        schedule via an atomic rename, so writes here never coordinate with a
+        reader — see docs on the tiktak side for the drain protocol.
+
+        Never allowed to raise. A write failure (bad path, disk full) must not
+        take down liveness polling — the event this call is measuring matters
+        more than the record of it.
+        """
+        events_file = getattr(self, "_events_file", None)
+        if not events_file:
+            return
+        try:
+            line = json.dumps({
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "subsystem": subsystem,
+                "endpoint": endpoint,
+                "status": status,
+                "latency_ms": latency_ms,
+                "username": getattr(self, "_user", None),
+            })
+            with open(events_file, "a") as f:
+                f.write(line + "\n")
+        except Exception:
+            pass
+
+    def _get(self, url, endpoint, *, subsystem="recorder-liveness", **kwargs):
+        """self.http_client.get(), instrumented with one request event.
+
+        `endpoint` is a fixed, low-cardinality label per call site — never
+        derived from the URL, which carries a room_id or a signature and would
+        blow up request_log's grouping. Recorded even when the call raises
+        (status=None, matching scraper-enumerate's existing request_log
+        contract for "the call never answered"), so an outage is visible
+        rather than just silently missing from the count.
+        """
+        start = time.monotonic()
+        status = None
+        try:
+            response = self.http_client.get(url, **kwargs)
+            status = getattr(response, "status_code", None)
+            return response
+        finally:
+            latency_ms = int((time.monotonic() - start) * 1000)
+            self._emit_request_event(subsystem, endpoint, status, latency_ms)
 
     def _is_authenticated(self) -> bool:
         response = self.http_client.get(f"{self.BASE_URL}/foryou")
@@ -46,9 +103,10 @@ class TikTokAPI:
         this flag is unreliable on its own — TikTok returns alive:true for
         long-ended rooms (room status 4) — so it must never be the sole signal.
         """
-        data = self.http_client.get(
+        data = self._get(
             f"{self.WEBCAST_URL}/webcast/room/check_alive/"
-            f"?aid=1988&region=CH&room_ids={room_id}&user_is_login=true"
+            f"?aid=1988&region=CH&room_ids={room_id}&user_is_login=true",
+            "webcast/room/check_alive",
         ).json()
 
         if "data" not in data or len(data["data"]) == 0:
@@ -76,8 +134,9 @@ class TikTokAPI:
         if not room_id:
             raise UserLiveError(TikTokError.USER_NOT_CURRENTLY_LIVE)
 
-        data = self.http_client.get(
-            f"{self.WEBCAST_URL}/webcast/room/info/?aid=1988&room_id={room_id}"
+        data = self._get(
+            f"{self.WEBCAST_URL}/webcast/room/info/?aid=1988&room_id={room_id}",
+            "webcast/room/info",
         ).json()
 
         if data.get("status_code") == 4003110:  # WAF block — no status available
@@ -165,8 +224,10 @@ class TikTokAPI:
 
     def _tikrec_get_room_id_signed_url(self, user: str) -> str:
         try:
-            response = self.http_client.get(
+            response = self._get(
                 f"{self.TIKREC_API}/tiktok/room/api/sign",
+                "tikrec/sign",
+                subsystem="recorder-tikrec",
                 params={"unique_id": user},
             )
             response.raise_for_status()
@@ -204,8 +265,9 @@ class TikTokAPI:
         offline (liveness is decided separately by is_room_alive), matching the
         tikrec path's contract.
         """
-        response = self.http_client.get(
+        response = self._get(
             self.API_URL,
+            "tiktok/api-live-room",
             params={"aid": "1988", "sourceType": "54", "uniqueId": user},
         )
         content = response.text
@@ -231,7 +293,11 @@ class TikTokAPI:
         """
         signed_url = self._tikrec_get_room_id_signed_url(user)
 
-        response = self.http_client.get(signed_url)
+        # This lands on tiktok.com (BASE_URL + signed_path) despite going
+        # through tikrec's signature — tikrec only signs the request, it does
+        # not proxy it. So this is a real TikTok request and belongs under
+        # recorder-liveness (_get()'s default), not recorder-tikrec.
+        response = self._get(signed_url, "tiktok/room-signed")
         content = response.text
 
         if not content or "Please wait" in content:
@@ -382,8 +448,9 @@ class TikTokAPI:
         If the API returns status code 4003110 and a username is provided,
         falls back to scraping the live page directly.
         """
-        data = self.http_client.get(
-            f"{self.WEBCAST_URL}/webcast/room/info/?aid=1988&room_id={room_id}"
+        data = self._get(
+            f"{self.WEBCAST_URL}/webcast/room/info/?aid=1988&room_id={room_id}",
+            "webcast/room/info",
         ).json()
 
         if "This account is private" in data:

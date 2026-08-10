@@ -45,6 +45,7 @@ def _build_config(args, mode, cookies, user=None):
         # from this file, falling back to automatic_interval above whenever the
         # file cannot answer for it.
         watchlist_path=getattr(args, "watchlist", None),
+        events_file=getattr(args, "events_file", None),
         cookies=cookies,
         proxy=args.proxy,
         output=args.output,
