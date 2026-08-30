@@ -55,6 +55,23 @@ BACKOFF_MAX_SECONDS = 300
 # but is the difference between a burst and a ramp.
 MAX_SPAWNS_PER_PASS = 20
 
+# How many monitors must be starting together before their first polls are
+# staggered.
+#
+# 🚨 A lone respawn must NOT be staggered. On 2026-08-30 @shellykimm was
+# recording when the recorder was restarted; her replacement monitor drew a 292s
+# stagger and the account went unwatched for nearly five minutes — with no
+# benefit, because the other 118 monitors had kept their offsets and there was
+# no herd to break up.
+#
+# The condition counts the batch rather than asking whether the supervisor is
+# young, because a time-based rule gets two of the three cases wrong: it would
+# leave a bulk watch-list addition unstaggered (50 new accounts in lockstep is
+# the same volley, whenever it happens) and would stagger a crash-respawn that
+# merely landed inside the window. What matters is how many first requests are
+# about to arrive together, not why any one of them is starting.
+STAGGER_BATCH_THRESHOLD = 5
+
 
 @dataclass(frozen=True)
 class WatchEntry:
@@ -349,10 +366,25 @@ class RecorderSupervisor:
             )
             result.deferred.append(user)
 
-        # Spawn what is wanted, missing, and not serving a backoff — up to this
-        # pass's budget. Ordering is watch-list order, which is stable, so a
-        # budgeted pass always makes progress rather than re-picking the same
-        # subset.
+        # Everyone wanted, missing, and off backoff. Computed before spawning
+        # anything, because whether to stagger depends on how big this batch is —
+        # a decision that cannot be made one user at a time.
+        ready = [
+            user
+            for user in desired
+            if user not in self.workers
+            and not (
+                (retry_at := self._retry_after.get(user)) is not None and now < retry_at
+            )
+        ]
+
+        # Stagger only when enough monitors are starting together to form a
+        # volley. The count includes users still queued behind the spawn budget:
+        # a 119-account cold start arrives as six batches of 20, and every one of
+        # those batches is a volley, so judging by this pass's slice alone would
+        # leave the tail of the roster unstaggered.
+        stagger = len(ready) > STAGGER_BATCH_THRESHOLD
+
         budget = self.max_spawns_per_pass
         for user in desired:
             if user in self.workers:
@@ -371,8 +403,9 @@ class RecorderSupervisor:
             )
             logger.info(
                 f"{'Respawning' if is_replacement else 'Starting'} monitor for @{user}"
+                f"{'' if stagger else ' (polling immediately — no batch to spread)'}"
             )
-            self.workers[user] = self.spawn_worker(user)
+            self.workers[user] = self.spawn_worker(user, stagger=stagger)
             self._spawned_at[user] = now
             budget -= 1
             if is_replacement:

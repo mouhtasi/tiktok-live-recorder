@@ -89,12 +89,15 @@ def run_supervised(args, mode, cookies):
 
     signal.signal(signal.SIGHUP, _on_sighup)
 
-    def spawn(username):
+    def spawn(username, stagger=True):
         stop_event = multiprocessing.Event()
         stop_now_event = multiprocessing.Event()
         config = _build_config(args, mode, cookies, user=username)
         config.stop_event = stop_event
         config.stop_now_event = stop_now_event
+        # The supervisor decides this: True for a batch that would otherwise
+        # poll in lockstep, False for a lone respawn that has no herd to spread.
+        config.stagger_first_poll = stagger
 
         proc = multiprocessing.Process(
             target=record_user, args=(config,), name=f"{PROC_TITLE_PREFIX}[@{username}]"

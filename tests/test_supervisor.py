@@ -96,7 +96,10 @@ def make_supervisor(tmp_path, users, **kwargs):
 
     spawned = []
 
-    def spawn(username):
+    def spawn(username, stagger=True):
+        # `stagger` is ignored here; §37's reconcile behaviour is what this file
+        # covers. Whether the flag is set correctly lives in
+        # test_stagger_is_cold_start_only.py.
         w = FakeWorker(username)
         spawned.append(w)
         return w

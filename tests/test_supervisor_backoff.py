@@ -80,7 +80,9 @@ def make_supervisor(tmp_path, users, **kwargs):
 
     spawned = []
 
-    def spawn(username):
+    def spawn(username, stagger=True):
+        # `stagger` is ignored here; whether it is set correctly is
+        # test_stagger_is_cold_start_only.py's subject, not this file's.
         w = FakeWorker(username)
         spawned.append(w)
         return w

@@ -50,6 +50,7 @@ class TikTokRecorder:
         # lands without respawning its monitor — a respawn truncates whatever it
         # is recording.
         self.watchlist_path = config.watchlist_path
+        self.stagger_first_poll = getattr(config, "stagger_first_poll", True)
         self.duration = config.duration
         self.output = config.output
         self.bitrate = config.bitrate
@@ -221,6 +222,14 @@ class TikTokRecorder:
         would hang stop_all() on shutdown.
         """
         if self.watchlist_path is None:
+            return
+
+        # 🚨 A lone respawn is not staggered. @shellykimm was recording when the
+        # recorder restarted on 2026-08-30; her replacement drew a 292s stagger
+        # and the account went unwatched for nearly five minutes, for nothing —
+        # the other 118 monitors had kept their offsets. The supervisor decides
+        # this, because only it can see how many are starting together.
+        if not getattr(self, "stagger_first_poll", True):
             return
 
         interval_s = self._poll_interval_minutes() * TimeOut.ONE_MINUTE

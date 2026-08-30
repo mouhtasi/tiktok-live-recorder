@@ -30,3 +30,9 @@ class RecorderConfig:
     # Optional request-event sink, appended to by TikTokAPI on every outbound
     # call. None (the default) disables it entirely — see TikTokAPI._get().
     events_file: str | None = None
+    # Whether this monitor delays its first poll by a random fraction of its
+    # interval. Set by the supervisor, True only when enough monitors are
+    # starting together to form a volley. 🚨 A lone respawn sets it False: there
+    # is no herd to break up, and delaying it blinds the one account most likely
+    # to have been recording a moment ago.
+    stagger_first_poll: bool = True
