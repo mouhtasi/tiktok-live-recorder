@@ -89,7 +89,7 @@ class FakeWorker:
         self._alive = False
 
 
-def make_supervisor(tmp_path, users):
+def make_supervisor(tmp_path, users, **kwargs):
     """Supervisor with an injected spawner, so no real processes are created."""
     watchlist = tmp_path / "users.txt"
     write_watchlist(watchlist, users)
@@ -105,6 +105,7 @@ def make_supervisor(tmp_path, users):
         watchlist_path=watchlist,
         stop_now_path=tmp_path / "stop_now.txt",
         spawn_worker=spawn,
+        **kwargs,
     )
     return sup, watchlist, spawned
 
@@ -241,8 +242,16 @@ def test_empty_watchlist_stops_everything(tmp_path):
 def test_dead_worker_in_watchlist_is_respawned(tmp_path):
     """§28: a monitor died from an uncaught exception and nobody respawned it —
     the recorder was blind to that user for 3.5h. The supervisor must notice and
-    respawn *only* that user."""
-    sup, _, spawned = make_supervisor(tmp_path, ["alice", "bob"])
+    respawn *only* that user.
+
+    Amended 2026-08-30: a worker that dies within `fast_exit_seconds` is now held
+    back before being replaced, because respawning those instantly is what turned
+    §28's opposite failure into a 119-monitor hot loop. §28's guarantee is
+    unchanged and still asserted here — the replacement *must* arrive — but it
+    arrives after the backoff rather than in the same pass. `fast_exit_seconds=0`
+    expresses "this death is not a flap", which is the case this test is about.
+    """
+    sup, _, spawned = make_supervisor(tmp_path, ["alice", "bob"], fast_exit_seconds=0)
     sup.reconcile()
     alice, bob = spawned[0], spawned[1]
 

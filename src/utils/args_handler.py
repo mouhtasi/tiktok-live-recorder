@@ -133,6 +133,22 @@ def parse_args():
     )
 
     parser.add_argument(
+        "-health-file",
+        dest="health_file",
+        default=None,
+        action="store",
+        help=(
+            "Path to a JSON file rewritten atomically on every supervisor pass "
+            "with monitor counts, cumulative deaths and respawns, and which "
+            "accounts are currently serving a restart backoff. Optional. It "
+            "exists because nothing outside the supervisor can observe a "
+            "per-account monitor dying: during the 2026-08-29 respawn storm the "
+            "status endpoint reported healthy throughout, since the only thing "
+            "it could see was the parent process — which was alive and busy."
+        ),
+    )
+
+    parser.add_argument(
         "-events-file",
         dest="events_file",
         default=None,
