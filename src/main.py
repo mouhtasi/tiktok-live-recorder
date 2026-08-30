@@ -10,17 +10,27 @@ PROC_TITLE_PREFIX = "tiktok-live-recorder"
 
 def record_user(config):
     from core.tiktok_recorder import TikTokRecorder
-    from utils.logger_manager import logger
+    from utils.logger_manager import logger, use_worker_log_file
 
     # Forked workers inherit the parent's command line, so without this every
     # monitor looks identical in `ps` and you cannot tell which process belongs
     # to which account — nor reliably distinguish ours from any other project's.
     _set_proc_title(f"{PROC_TITLE_PREFIX} [@{config.user}]")
 
+    # Workers also inherit the parent's rotating file handler, all pointing at
+    # one path. Rotation is a rename, so under load the ~119 monitors overwrite
+    # each other's backups — on 2026-08-29 that left three 1,123-byte files
+    # where the storm's evidence should have been. Own the file, or lose it.
+    if config.user:
+        use_worker_log_file(config.user)
+
     try:
         TikTokRecorder(config).run()
     except Exception as e:
-        logger.error(f"{e}", exc_info=True)
+        # Deliberately logs the account. This handler is the last thing a dying
+        # monitor does, and a bare message gives the supervisor's respawn line
+        # nothing to be correlated against.
+        logger.error(f"Monitor for @{config.user} is exiting: {e}", exc_info=True)
 
 
 def _set_proc_title(title):
@@ -96,6 +106,7 @@ def run_supervised(args, mode, cookies):
         watchlist_path=args.watchlist,
         stop_now_path=args.stop_now_file,
         spawn_worker=spawn,
+        health_path=getattr(args, "health_file", None),
     )
 
     logger.info(f"Supervising watch-list {args.watchlist}")

@@ -57,6 +57,11 @@ coverage.xml
 
 # Django stuff:
 *.log
+# Rotated logs: *.log does not match a rotation suffix, so tiktok-recorder.log.1
+# and the per-monitor files under logs/ would otherwise show up as untracked in
+# a public repo. Both are runtime state, like users.txt.
+*.log.*
+logs/
 local_settings.py
 db.sqlite3
 db.sqlite3-journal
