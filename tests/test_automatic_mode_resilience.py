@@ -38,7 +38,7 @@ from curl_cffi.requests.exceptions import ConnectionError as CurlConnectionError
 
 from core.tiktok_recorder import TikTokRecorder
 from utils.custom_exceptions import LiveNotFound, UserLiveError
-from utils.enums import TimeOut
+from utils.enums import Mode, TimeOut
 
 # The exception set the previous (upstream `develop`) handler caught. Anything
 # outside this tuple escaped the loop and killed the per-user monitor process.
@@ -61,6 +61,17 @@ def _make_recorder(interval=5, user="tester"):
     # No watch-list either, so the recheck delay stays the global
     # `automatic_interval` these tests assert on (§58).
     rec.watchlist_path = None
+    # Set because automatic_mode() now runs _setup() inside its retry loop (the
+    # 2026-08-29 respawn-storm fix). Without these the fake raises AttributeError
+    # into the very catch-all this file exists to test, so every case would
+    # "pass" on the wrong exception.
+    rec.url = None
+    rec.room_id = None
+    rec.mode = Mode.AUTOMATIC
+    rec.sec_uid = None
+    rec._proxy = None
+    rec._cookies = None
+    rec.tiktok.is_country_blacklisted.return_value = False
     return rec
 
 

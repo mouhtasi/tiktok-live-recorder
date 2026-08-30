@@ -47,6 +47,7 @@ import pytest
 from core.supervisor import read_watchlist, read_watchlist_entries
 from core.tiktok_recorder import TikTokRecorder
 from utils.custom_exceptions import LiveNotFound
+from utils.enums import Mode
 
 
 # --- parsing the extended watch-list ----------------------------------------
@@ -155,6 +156,16 @@ def _make_recorder(tmp_path=None, interval=5, user="alice", stop_event=None):
     rec._stop_event = stop_event
     rec._stop_now_event = None
     rec.watchlist_path = (tmp_path / "users.txt") if tmp_path else None
+    # Set because automatic_mode() now runs _setup() inside its retry loop (the
+    # 2026-08-29 respawn-storm fix); without these the fake raises AttributeError
+    # into the loop's catch-all instead of exercising the interval logic.
+    rec.url = None
+    rec.room_id = None
+    rec.mode = Mode.AUTOMATIC
+    rec.sec_uid = None
+    rec._proxy = None
+    rec._cookies = None
+    rec.tiktok.is_country_blacklisted.return_value = False
     return rec
 
 

@@ -32,7 +32,7 @@ import pytest
 
 from core.tiktok_recorder import TikTokRecorder
 from utils.custom_exceptions import UserLiveError
-from utils.enums import TimeOut
+from utils.enums import Mode, TimeOut
 
 
 class _BreakLoop(Exception):
@@ -46,6 +46,20 @@ def _make_recorder(should_stop=None, interval=5, user="tester"):
     rec.tiktok = Mock()
     rec._stop_event = None
     rec._stop_now_event = None
+    # State a real __init__ always sets, and that these fakes used to omit
+    # because automatic_mode() never touched it. It does now: _setup() runs from
+    # inside the poll loop's try (the 2026-08-29 respawn-storm fix), so a fake
+    # missing these raises AttributeError *into the loop's catch-all* — the test
+    # then still passes or fails, but about the wrong branch, with the real
+    # assertion never reached. An incomplete fake is not a neutral omission once
+    # the code under test has a catch-all.
+    rec.url = None
+    rec.room_id = None
+    rec.mode = Mode.AUTOMATIC
+    rec.sec_uid = None
+    rec._proxy = None
+    rec._cookies = None
+    rec.tiktok.is_country_blacklisted.return_value = False
     # No watch-list, so _poll_interval_minutes() resolves to `automatic_interval`
     # and these tests keep asserting on the global default. §58's per-account
     # tiering is covered in test_adaptive_poll_interval.py.

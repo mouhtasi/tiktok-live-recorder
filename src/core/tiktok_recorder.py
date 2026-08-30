@@ -123,10 +123,15 @@ class TikTokRecorder:
 
             logger.info(f"USERNAME: {self.user}" + ("\n" if not self.room_id else ""))
             if self.room_id:
-                logger.info(
-                    f"ROOM_ID:  {self.room_id}"
-                    + ("\n" if not self.tiktok.is_room_alive(self.room_id) else "")
-                )
+                # Deliberately does NOT probe liveness here. This line used to
+                # append "\n" when the room was offline, which cost a full
+                # is_room_alive() request per monitor start — a network call made
+                # solely to decide a log message's trailing whitespace. The
+                # caller re-resolves liveness on the very next statement anyway,
+                # so it was also a duplicate. At 119 monitors that was 119 wasted
+                # requests per start, spent against the same WAF budget whose
+                # refusals caused the 2026-08-29 respawn storm.
+                logger.info(f"ROOM_ID:  {self.room_id}\n")
 
         # If proxy was used for the initial checks, switch to a direct connection
         # for the actual stream download to avoid proxy bottlenecks
@@ -148,13 +153,28 @@ class TikTokRecorder:
         the authenticated user. If any follower is live, it starts recording
         their live stream in a separate process.
         """
+        if self.mode == Mode.AUTOMATIC:
+            # NOT preceded by _setup(). Automatic mode runs its own setup from
+            # inside the retry loop, so a network failure there is retried like
+            # any other poll error instead of killing the monitor process.
+            #
+            # This is the 2026-08-29 respawn storm. _setup()'s room-id call
+            # raised UserLiveError(WAF_BLOCKED) — a class automatic_mode()
+            # already handles as "wait and try again" — but raised out here it
+            # escaped run(), record_user() logged it, and the process exited.
+            # The supervisor respawned all 119 monitors every 5s: ~63,000
+            # requests/hour at TikTok, pihole's rate limiter wedged, load 38.
+            # A retryable condition must not be raised where nothing retries.
+            self.automatic_mode()
+            return
+
+        # Manual and followers mode keep the fail-fast setup. Both are one-shot
+        # foreground invocations with a human reading the error; there is no
+        # supervisor to turn a hard exit into a hot loop.
         self._setup()
 
         if self.mode == Mode.MANUAL:
             self.manual_mode()
-
-        elif self.mode == Mode.AUTOMATIC:
-            self.automatic_mode()
 
         elif self.mode == Mode.FOLLOWERS:
             self.followers_mode()
@@ -169,9 +189,28 @@ class TikTokRecorder:
         # The stop flag is read HERE, at the poll boundary — never inside
         # start_recording(), which blocks for the whole broadcast. So a monitor
         # told to stop mid-stream finishes writing its file and exits after.
+        #
+        # Setup happens inside the loop rather than before it (see run()), but
+        # still only once: it resolves things that do not change between polls,
+        # and re-running its country probe every poll would add one request per
+        # account per cycle to a budget this subsystem is already short of. The
+        # flag flips only on success, so a monitor whose setup is failing keeps
+        # retrying it and one whose setup succeeded never pays for it again.
+        setup_done = False
+
         while not self.should_stop():
             try:
-                self.room_id = self.tiktok.get_room_id_from_user(self.user)
+                if not setup_done:
+                    # _setup() has already resolved the room id, so re-resolving
+                    # it here would spend a second request on an answer we hold.
+                    # One duplicate per monitor start is 119 needless requests
+                    # per recorder start, against the budget whose exhaustion is
+                    # the whole reason this loop was restructured.
+                    self._setup()
+                    setup_done = True
+                else:
+                    self.room_id = self.tiktok.get_room_id_from_user(self.user)
+
                 self.manual_mode()
 
             except (UserLiveError, LiveNotFound) as ex:
