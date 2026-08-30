@@ -123,7 +123,7 @@ def test_every_level_reaches_at_least_one_console_handler(fresh_logger, level):
 def test_the_supervisors_respawn_warning_is_not_swallowed(fresh_logger):
     """The exact line whose absence cost the 2026-08-29 diagnosis."""
     read = _capture_console(fresh_logger)
-    fresh_logger.warning("[!] Monitor for @lulu83245 died — respawning it.")
+    fresh_logger.warning("[!] Monitor for @alice died — respawning it.")
 
     assert "died — respawning it" in read()
 

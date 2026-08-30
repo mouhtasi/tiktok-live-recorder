@@ -18,8 +18,9 @@ WORKER_LOG_BACKUPS = int(os.environ.get("TIKTOK_RECORDER_LOG_BACKUPS", 1))
 # constant. Anything outside this set is replaced before it becomes a filename.
 _UNSAFE_IN_FILENAME = re.compile(r"[^A-Za-z0-9._-]")
 # Collapse runs of dots as well. A single dot is legitimate in a TikTok handle
-# (@mei._.108), but ".." in a filename reads as traversal even where it cannot
-# act as one, and a log path is a thing people paste into commands.
+# (they routinely contain "." and "_"), but ".." in a filename reads as traversal
+# even where it cannot act as one, and a log path is a thing people paste into
+# commands.
 _DOT_RUN = re.compile(r"\.{2,}")
 
 
