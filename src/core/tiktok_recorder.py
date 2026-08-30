@@ -1,3 +1,4 @@
+import random
 import time
 from http.client import HTTPException
 from pathlib import Path
@@ -12,6 +13,22 @@ from utils.recorder_config import RecorderConfig
 from utils.video_management import VideoManagement
 from utils.custom_exceptions import LiveNotFound, UserLiveError, TikTokRecorderError
 from utils.enums import Mode, Error, TimeOut, TikTokError
+
+# Upper bound on the one-off delay before a monitor's first poll.
+#
+# Every monitor starts within ~30s of the recorder starting and nothing offsets
+# their timers, so each §58 tier fires as one synchronised volley. Measured on
+# prod 2026-08-30, minutes after the §76 deploy: the first 20 requests of a
+# volley returned 200 and every one after them returned 403, recovering after a
+# few minutes of quiet. A short-window burst threshold, not a ban — so the fix
+# is to never present a burst.
+#
+# The cap binds before the poll interval for anything on a slow tier. A 60-minute
+# account spread across a full hour could sit idle for an hour after a restart,
+# and 🚨 a missed live is unrecoverable, so the spread is bounded by how long the
+# recorder may stay blind rather than by the interval. Five minutes still thins
+# 94 cold accounts to one request every ~3.2s, which is far inside budget.
+INITIAL_POLL_JITTER_MAX_S = 300
 
 
 class TikTokRecorder:
@@ -185,6 +202,37 @@ class TikTokRecorder:
 
         self.start_recording(self.user, self.room_id)
 
+    def _stagger_first_poll(self):
+        """Wait a random fraction of this monitor's interval before polling.
+
+        Applied once, never per poll. Every later poll inherits the offset, so a
+        monitor that starts 137s late stays 137s out of step with its tier for
+        as long as it lives — the herd is broken up for one delay, paid once,
+        rather than latency added to every cycle forever.
+
+        🚨 Only in supervised (watch-list) mode. A single-account CLI run has no
+        herd, and making someone wait up to five minutes for
+        `-user someone -mode automatic` would be a bug wearing a safeguard's
+        clothes.
+
+        The wait goes through _wait_for_next_poll, so it is interruptible: §37's
+        stop is cooperative and read at poll boundaries, and an uninterruptible
+        initial wait would make every watch-list removal take up to the cap and
+        would hang stop_all() on shutdown.
+        """
+        if self.watchlist_path is None:
+            return
+
+        interval_s = self._poll_interval_minutes() * TimeOut.ONE_MINUTE
+        spread = min(interval_s, INITIAL_POLL_JITTER_MAX_S)
+        delay = random.uniform(0, spread)
+
+        logger.info(
+            f"Staggering @{self.user}'s first poll by {delay:.0f}s so this tier "
+            "does not poll in lockstep"
+        )
+        self._wait_for_next_poll(delay)
+
     def automatic_mode(self):
         # The stop flag is read HERE, at the poll boundary — never inside
         # start_recording(), which blocks for the whole broadcast. So a monitor
@@ -196,6 +244,8 @@ class TikTokRecorder:
         # account per cycle to a budget this subsystem is already short of. The
         # flag flips only on success, so a monitor whose setup is failing keeps
         # retrying it and one whose setup succeeded never pays for it again.
+        self._stagger_first_poll()
+
         setup_done = False
 
         while not self.should_stop():
