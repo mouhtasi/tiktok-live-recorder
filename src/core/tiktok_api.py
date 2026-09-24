@@ -447,11 +447,18 @@ class TikTokAPI:
         Return the cdn (flv or m3u8) of the streaming.
         If the API returns status code 4003110 and a username is provided,
         falls back to scraping the live page directly.
+
+        Also keeps the room's `create_time` in `last_room_created_at` (unix
+        seconds, or None) so the recorder can say how late it joined — see
+        tests/test_room_sidecar.py. Cleared first, so a response without it can
+        never leave the previous broadcast's start in place.
         """
+        self.last_room_created_at = None
         data = self._get(
             f"{self.WEBCAST_URL}/webcast/room/info/?aid=1988&room_id={room_id}",
             "webcast/room/info",
         ).json()
+        self.last_room_created_at = (data.get("data") or {}).get("create_time")
 
         if "This account is private" in data:
             raise UserLiveError(TikTokError.ACCOUNT_PRIVATE)

@@ -1,3 +1,5 @@
+import json
+import os
 import random
 import time
 from http.client import HTTPException
@@ -367,6 +369,44 @@ class TikTokRecorder:
             return str(Path(self.output) / filename)
         return filename
 
+    def _write_room_sidecar(self, output: str, room_id) -> None:
+        """Record when the broadcast began, beside the capture, for ingest.
+
+        `TK_<user>_<ts>_flv.mp4` gets `TK_<user>_<ts>.room.json`, named for the
+        *converted* mp4 so ingest finds it under the name it ingests — including
+        an orphaned `_flv` capture that ingest converts itself. `room_created_at`
+        is None when room/info did not say (the WAF page-scrape path): unknown
+        must reach the page as unknown, never as a zero-minute join.
+
+        🚨 Bookkeeping only. Every failure is logged and swallowed — the
+        recording this describes matters more than the note about it.
+        """
+        created = getattr(self.tiktok, "last_room_created_at", None)
+        if isinstance(created, bool) or not isinstance(created, int) or created <= 0:
+            created = None
+        joined = int(time.time())
+        sidecar = Path(output.replace("_flv.mp4", ".room.json"))
+        tmp = sidecar.with_name(sidecar.name + ".tmp")
+        try:
+            tmp.write_text(json.dumps({
+                "room_id": str(room_id),
+                "room_created_at": created,
+                "joined_at": joined,
+            }))
+            os.replace(tmp, sidecar)
+        except OSError as ex:
+            logger.warning(f"Could not write room sidecar {sidecar}: {ex}")
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            return
+        if created is not None:
+            logger.info(
+                f"Joined @{self.user}'s broadcast {(joined - created) / 60:.0f} "
+                "minutes after it started"
+            )
+
     def start_recording(self, user, room_id):
         """
         Start recording live
@@ -376,6 +416,7 @@ class TikTokRecorder:
             raise LiveNotFound(TikTokError.RETRIEVE_LIVE_URL)
 
         output = self._build_output_path(user)
+        self._write_room_sidecar(output, room_id)
 
         if self.duration:
             logger.info(f"Started recording for {self.duration} seconds ")
