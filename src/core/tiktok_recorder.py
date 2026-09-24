@@ -62,6 +62,30 @@ class TikTokRecorder:
         self._cookies = config.cookies
         self._stop_event = config.stop_event
         self._stop_now_event = config.stop_now_event
+        self._deadline = getattr(config, "deadline", None)
+
+    # §94 — how long each kind of work may take before the supervisor may call
+    # this monitor stuck. Generous on purpose: ending a working monitor costs a
+    # poll (or truncates a recording), so a false "stuck" must be rare. A poll is
+    # a handful of curl_cffi calls with 30s timeouts; a stall is bounded by the
+    # stream's 60s read timeout plus a re-check; a conversion is a remux of a
+    # file that can reach 5 GB.
+    POLL_BUDGET_S = 600
+    STALL_BUDGET_S = 600
+    CONVERT_BUDGET_S = 2 * 3600
+    # How often a waiting monitor re-reads its own interval: the hot tier, so a
+    # re-tier to hot costs at most one hot poll of delay.
+    RETIER_CHECK_S = 5 * 60
+
+    def _promise(self, seconds: float) -> None:
+        """Publish "I will act again within `seconds`" for the supervisor.
+
+        getattr, not the attribute: hand-built test doubles skip __init__, and
+        an unsupervised run has no deadline at all. Both mean "no promise".
+        """
+        deadline = getattr(self, "_deadline", None)
+        if deadline is not None:
+            deadline.value = time.time() + seconds
 
     def should_stop(self) -> bool:
         """Retire this monitor at the next poll boundary (never mid-recording)."""
@@ -113,11 +137,26 @@ class TikTokRecorder:
         opt-out.
 
         Unsupervised runs (single-user manual mode) have no event and still sleep.
+
+        The wait runs in slices of at most RETIER_CHECK_S, re-reading this
+        monitor's interval between them, so a re-tier lands mid-wait. On
+        2026-09-24 @yumehime555's first stream ended 05:41 and her monitor began
+        a 60-minute cold wait; tiktak made her hot two minutes later, she went
+        live again at 05:42:50, and we joined 26 minutes in. A stream that ends
+        is often about to restart — that is exactly when the tier changes.
         """
-        if self._stop_event is not None:
-            self._stop_event.wait(seconds)
-        else:
+        self._promise(seconds + self.POLL_BUDGET_S)
+        if self._stop_event is None:
             time.sleep(seconds)
+            return
+        start = time.monotonic()
+        while True:
+            elapsed = time.monotonic() - start
+            if elapsed >= seconds:
+                return
+            if self._stop_event.wait(min(seconds - elapsed, self.RETIER_CHECK_S)):
+                return
+            seconds = min(seconds, self._poll_interval_minutes() * TimeOut.ONE_MINUTE)
 
     def _setup(self):
         """Resolve user/room data and validate prerequisites via network calls."""
@@ -260,6 +299,7 @@ class TikTokRecorder:
         setup_done = False
 
         while not self.should_stop():
+            self._promise(self.POLL_BUDGET_S)
             try:
                 if not setup_done:
                     # _setup() has already resolved the room id, so re-resolving
@@ -296,7 +336,9 @@ class TikTokRecorder:
                     f"Recoverable error in automatic mode for @{self.user}, "
                     f"retrying after delay: {ex}"
                 )
-                time.sleep(TimeOut.CONNECTION_CLOSED * TimeOut.ONE_MINUTE)
+                delay = TimeOut.CONNECTION_CLOSED * TimeOut.ONE_MINUTE
+                self._promise(delay + self.POLL_BUDGET_S)
+                time.sleep(delay)
 
         logger.info(f"Monitor for @{self.user} stopping as requested.")
 
@@ -430,6 +472,7 @@ class TikTokRecorder:
         with open(output, "wb") as out_file:
             stop_recording = False
             while not stop_recording:
+                self._promise(self.STALL_BUDGET_S)
                 try:
                     if not self.tiktok.is_room_alive(room_id):
                         logger.info("User is no longer live. Stopping recording.")
@@ -441,6 +484,8 @@ class TikTokRecorder:
                         if len(buffer) >= buffer_size:
                             out_file.write(buffer)
                             buffer.clear()
+                            # Bytes are arriving: this monitor is working (§94).
+                            self._promise(self.STALL_BUDGET_S)
 
                         # Force-stop: break out of the download loop rather than
                         # being killed. Falling through leaves the `finally` to
@@ -494,6 +539,7 @@ class TikTokRecorder:
             self._stop_now_event.clear()
 
         logger.info(f"Recording finished: {Path(output).resolve()}\n")
+        self._promise(self.CONVERT_BUDGET_S)
         VideoManagement.convert_flv_to_mp4(output, self.bitrate, self.ffmpeg_path)
 
     def check_country_blacklisted(self):

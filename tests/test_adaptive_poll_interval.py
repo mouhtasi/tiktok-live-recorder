@@ -238,10 +238,18 @@ def test_supervised_wait_uses_the_stop_event_not_sleep(tmp_path):
     (tmp_path / "users.txt").write_text("alice 60\n")
     stop = threading.Event()
     rec = _make_recorder(tmp_path, interval=5, user="alice", stop_event=stop)
+    # §94's wait runs in slices on the monotonic clock; a mocked wait returns at
+    # once, so it must advance a fake clock or the loop spins in real time.
+    clock = {"t": 0.0}
 
-    with patch.object(stop, "wait", return_value=False) as waited:
-        with patch("core.tiktok_recorder.time.sleep") as slept:
-            rec._wait_for_next_poll(42)
+    def fake_wait(timeout):
+        clock["t"] += timeout
+        return False
+
+    with patch.object(stop, "wait", side_effect=fake_wait) as waited, patch(
+        "core.tiktok_recorder.time.monotonic", lambda: clock["t"]
+    ), patch("core.tiktok_recorder.time.sleep") as slept:
+        rec._wait_for_next_poll(42)
 
     waited.assert_called_once_with(42)
     slept.assert_not_called()

@@ -519,9 +519,23 @@ class TikTokAPI:
 
         return best_flv
 
+    # (connect, read). The read timeout is the longest silence between two
+    # bytes, not the length of the broadcast.
+    STREAM_TIMEOUT = (10, 60)
+
     def download_live_stream(self, live_url: str):
-        """Generator that returns the live stream for a given room_id."""
-        stream = self._http_client_stream.get(live_url, stream=True)
+        """Generator that returns the live stream for a given room_id.
+
+        🚨 Never without a timeout (§94). This is a plain `requests` session —
+        unlike the curl_cffi API client, it has no default — and a CDN that
+        stalls without closing the socket blocked @_bbylola_'s monitor for six
+        days, alive and "healthy", watching nothing. With a read timeout the
+        stall raises a RequestException into start_recording()'s hiccup path,
+        which re-checks the room and reconnects or finishes the file.
+        """
+        stream = self._http_client_stream.get(
+            live_url, stream=True, timeout=self.STREAM_TIMEOUT
+        )
         for chunk in stream.iter_content(chunk_size=4096):
             if chunk:
                 yield chunk

@@ -197,6 +197,7 @@ class RecorderSupervisor:
         health_path=None,
         now=time.monotonic,
         jitter=None,
+        wall=time.time,
     ):
         self.watchlist_path = Path(watchlist_path)
         self.stop_now_path = Path(stop_now_path) if stop_now_path else None
@@ -213,6 +214,9 @@ class RecorderSupervisor:
         # fix the jitter could not assert the schedule at all.
         self._now = now
         self._jitter = jitter or (lambda: random.uniform(0.5, 1.0))
+        # Wall clock, separately: a monitor's deadline (§94) is written by
+        # another process, and monotonic clocks are not comparable across them.
+        self._wall = wall
 
         self.workers: dict[str, object] = {}
         # When each live worker was spawned, so a death can be classified as
@@ -236,6 +240,12 @@ class RecorderSupervisor:
         # it has finished writing its file. We must not ask twice, and must not
         # treat "still here" as "failed to stop".
         self._stopping: set[str] = set()
+        # §94 — workers ended because they were past their own deadline: alive,
+        # but stuck. Counted apart from deaths — the death count alarms on
+        # crashes, and this is a different fault with a different cause.
+        self._stuck_total = 0
+        self._stuck_recent: list[dict] = []
+        self._killed_stuck: set[str] = set()
 
     # ── inputs ────────────────────────────────────────────────────────────────
 
@@ -320,6 +330,8 @@ class RecorderSupervisor:
                 if now - self._spawned_at.get(user, now) >= self.fast_exit_seconds:
                     self._fast_exits.pop(user, None)
 
+        self._end_stuck_workers()
+
         # Reap the dead first, so a user who died can be respawned in the same
         # pass rather than waiting for the next one.
         for user, worker in list(self.workers.items()):
@@ -329,6 +341,16 @@ class RecorderSupervisor:
             del self.workers[user]
             self._stopping.discard(user)
             lifetime = now - self._spawned_at.pop(user, now)
+            was_stuck = user in self._killed_stuck
+            self._killed_stuck.discard(user)
+
+            if was_stuck and user in desired:
+                # We ended it; it did not crash. Replace it at once, with no
+                # backoff and no death counted.
+                self._fast_exits.pop(user, None)
+                self._retry_after.pop(user, None)
+                replacing.add(user)
+                continue
 
             if user not in desired:
                 # Retired on request, not a death. Deliberately not counted:
@@ -427,6 +449,45 @@ class RecorderSupervisor:
         self._write_health(result, desired)
         return result
 
+    # ── stuck workers (§94) ───────────────────────────────────────────────────
+
+    def _end_stuck_workers(self) -> None:
+        """End every live worker that is past the deadline it published.
+
+        On 2026-09-24 nine monitors had been blocked for up to six days — alive,
+        so every check here called them healthy, and watching nobody. A monitor
+        now promises when it will act next (poll, write, convert); missing that
+        is the only signal that separates "stuck" from "busy".
+
+        A handle without `seconds_overdue` (an older monitor, a test fake) and
+        one that has not promised anything yet (None) are never judged. A worker
+        we already ended that is somehow still alive gets `kill()`, not a
+        second count.
+        """
+        wall_now = self._wall()
+        for user, worker in list(self.workers.items()):
+            overdue_of = getattr(worker, "seconds_overdue", None)
+            if overdue_of is None or not worker.is_alive():
+                continue
+            if user in self._killed_stuck:
+                kill = getattr(worker, "kill", None)
+                if kill is not None:
+                    kill()
+                continue
+            overdue = overdue_of(wall_now)
+            if overdue is None or overdue <= 0:
+                continue
+            logger.warning(
+                f"[!] Monitor for @{user} is stuck: {overdue:.0f}s past the time it "
+                "promised to act again. Ending it so it can be replaced."
+            )
+            worker.terminate()
+            self._killed_stuck.add(user)
+            self._stuck_total += 1
+            self._stuck_recent = (self._stuck_recent + [
+                {"user": user, "at": round(wall_now), "overdue_s": round(overdue)}
+            ])[-20:]
+
     # ── backoff ───────────────────────────────────────────────────────────────
 
     def _backoff_delay(self, strikes: int) -> float:
@@ -480,6 +541,8 @@ class RecorderSupervisor:
                     for user in self._retry_after
                 },
                 "queued": len(result.queued),
+                "stuck_total": self._stuck_total,
+                "stuck_recent": self._stuck_recent,
             }
             tmp = self.health_path.with_suffix(".tmp")
             tmp.write_text(json.dumps(payload))

@@ -36,3 +36,7 @@ class RecorderConfig:
     # is no herd to break up, and delaying it blinds the one account most likely
     # to have been recording a moment ago.
     stagger_first_poll: bool = True
+    # §94: a shared multiprocessing.Value holding the wall-clock time by which
+    # this monitor promises to act again. The supervisor ends a live worker that
+    # is past it — the only way to see a monitor that is alive but stuck.
+    deadline: object | None = None

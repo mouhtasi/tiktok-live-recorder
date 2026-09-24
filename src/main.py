@@ -98,12 +98,15 @@ def run_supervised(args, mode, cookies):
         # The supervisor decides this: True for a batch that would otherwise
         # poll in lockstep, False for a lone respawn that has no herd to spread.
         config.stagger_first_poll = stagger
+        # §94: 0.0 until the monitor makes its first promise.
+        deadline = multiprocessing.Value("d", 0.0)
+        config.deadline = deadline
 
         proc = multiprocessing.Process(
             target=record_user, args=(config,), name=f"{PROC_TITLE_PREFIX}[@{username}]"
         )
         proc.start()
-        return _Worker(username, proc, stop_event, stop_now_event)
+        return _Worker(username, proc, stop_event, stop_now_event, deadline)
 
     supervisor = RecorderSupervisor(
         watchlist_path=args.watchlist,
@@ -128,16 +131,35 @@ class _Worker:
     Stopping is cooperative, never a kill: the worker holds the output file open
     and the bytes on disk are raw FLV until convert_flv_to_mp4() runs at the end,
     so terminating it mid-stream would leave an unconverted file behind.
+
+    The one exception is a worker past its own deadline (§94): it is writing
+    nothing, so there is nothing to protect, and tiktak's ingest adopts a raw
+    `_flv` capture it leaves behind (§46). `terminate()` / `kill()` exist for
+    that case only.
     """
 
-    def __init__(self, username, proc, stop_event, stop_now_event):
+    def __init__(self, username, proc, stop_event, stop_now_event, deadline=None):
         self.username = username
         self.proc = proc
         self._stop_event = stop_event
         self._stop_now_event = stop_now_event
+        self._deadline = deadline
 
     def is_alive(self):
         return self.proc.is_alive()
+
+    def seconds_overdue(self, now):
+        """How far past its promised deadline the monitor is; None if it has
+        not promised anything yet."""
+        if self._deadline is None or not self._deadline.value:
+            return None
+        return max(0.0, now - self._deadline.value)
+
+    def terminate(self):
+        self.proc.terminate()
+
+    def kill(self):
+        self.proc.kill()
 
     def request_stop(self):
         """Exit at the next poll boundary — finishing any recording in flight."""
