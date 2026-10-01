@@ -12,6 +12,7 @@ from core.supervisor import read_watchlist_entries
 from core.tiktok_api import TikTokAPI
 from utils.logger_manager import logger
 from utils.recorder_config import RecorderConfig
+from utils.utils import read_session_cookies
 from utils.video_management import VideoManagement
 from utils.custom_exceptions import LiveNotFound, UserLiveError, TikTokRecorderError
 from utils.enums import Mode, Error, TimeOut, TikTokError
@@ -60,6 +61,12 @@ class TikTokRecorder:
         self.use_telegram = config.use_telegram
         self._proxy = config.proxy
         self._cookies = config.cookies
+        # §100: the owner's session, for this monitor only, when its watch-list
+        # row says `cookies`. Starts anonymous; _apply_session() decides per poll.
+        self._base_cookies = config.cookies
+        self._session_cookies_path = getattr(config, "session_cookies_path", None)
+        self._session_on = False
+        self._events_file = config.events_file
         self._stop_event = config.stop_event
         self._stop_now_event = config.stop_now_event
         self._deadline = getattr(config, "deadline", None)
@@ -94,6 +101,53 @@ class TikTokRecorder:
     def should_stop_now(self) -> bool:
         """End the *current recording* immediately (but still finalize it)."""
         return self._stop_now_event is not None and self._stop_now_event.is_set()
+
+    def _apply_session(self) -> None:
+        """Poll with the owner's session iff this monitor's row says `cookies`.
+
+        tiktak §100. An age-restricted live answers 4003110 to an anonymous
+        room-info request and "login required" on the live page, so the monitor
+        sees a room id and never records (@meena_kpsr, 2026-10-01). The session
+        is per monitor, never in the shared cookies.json, so the other monitors'
+        ~1,000 polls an hour stay anonymous.
+
+        Called only at a poll boundary, so a switch never lands mid-recording.
+        An unreadable watch-list or an unlisted user is no instruction and
+        changes nothing. A flagged row with no usable session file stays
+        anonymous and says so, every poll, until the file is fixed.
+        """
+        if not self.watchlist_path:
+            return
+        try:
+            entry = next((e for e in read_watchlist_entries(self.watchlist_path)
+                          if e.username == self.user), None)
+        except (OSError, ValueError):
+            return
+        if entry is None or entry.session == self._session_on:
+            return
+
+        cookies = dict(self._base_cookies or {})
+        if entry.session:
+            session = read_session_cookies(self._session_cookies_path)
+            if not session:
+                logger.warning(
+                    f"[!] @{self.user} is marked for the owner's session, but "
+                    f"{self._session_cookies_path!r} has no TikTok cookies — "
+                    "polling anonymously"
+                )
+                return
+            cookies.update(session)
+
+        self.tiktok = TikTokAPI(
+            proxy=self._proxy, cookies=cookies,
+            events_file=self._events_file, user=self.user,
+        )
+        self._cookies = cookies
+        self._session_on = entry.session
+        logger.info(
+            f"@{self.user}: "
+            f"{'polling with' if entry.session else 'no longer using'} the owner's session"
+        )
 
     def _poll_interval_minutes(self) -> int:
         """This monitor's recheck interval, re-read from the watch-list (§58).
@@ -301,6 +355,13 @@ class TikTokRecorder:
         while not self.should_stop():
             self._promise(self.POLL_BUDGET_S)
             try:
+                # 🚨 Its own guard: a fault in the session switch must cost
+                # the session, never the poll. Raised into the catch-all
+                # below, it would skip this poll and every one after it.
+                try:
+                    self._apply_session()
+                except Exception as ex:
+                    logger.error(f"@{self.user}: session switch failed ({ex!r}) — polling as before")
                 if not setup_done:
                     # _setup() has already resolved the room id, so re-resolving
                     # it here would spend a second request on an answer we hold.

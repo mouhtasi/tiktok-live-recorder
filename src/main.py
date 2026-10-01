@@ -56,6 +56,7 @@ def _build_config(args, mode, cookies, user=None):
         # file cannot answer for it.
         watchlist_path=getattr(args, "watchlist", None),
         events_file=getattr(args, "events_file", None),
+        session_cookies_path=getattr(args, "session_cookies", None),
         cookies=cookies,
         proxy=args.proxy,
         output=args.output,

@@ -30,6 +30,9 @@ class RecorderConfig:
     # Optional request-event sink, appended to by TikTokAPI on every outbound
     # call. None (the default) disables it entirely — see TikTokAPI._get().
     events_file: str | None = None
+    # tiktak §100: a Netscape cookies.txt holding the owner's session, loaded only
+    # by monitors whose watch-list row says `cookies`. None: nobody gets it.
+    session_cookies_path: str | None = None
     # Whether this monitor delays its first poll by a random fraction of its
     # interval. Set by the supervisor, True only when enough monitors are
     # starting together to form a volley. 🚨 A lone respawn sets it False: there

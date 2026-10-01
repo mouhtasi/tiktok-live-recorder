@@ -163,6 +163,19 @@ def parse_args():
     )
 
     parser.add_argument(
+        "-session-cookies",
+        dest="session_cookies",
+        default=None,
+        action="store",
+        help=(
+            "Path to a Netscape cookies.txt with a logged-in TikTok session. "
+            "Only monitors whose watch-list row carries a `cookies` token send "
+            "it (age-restricted lives); every other monitor stays anonymous. "
+            "Optional."
+        ),
+    )
+
+    parser.add_argument(
         "-no-update-check",
         dest="update_check",
         action="store_false",

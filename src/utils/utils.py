@@ -1,3 +1,4 @@
+import http.cookiejar
 import json
 import os
 
@@ -19,6 +20,23 @@ def read_cookies():
     config_path = os.path.join(script_dir, "..", "cookies.json")
     with open(config_path, "r") as f:
         return json.load(f)
+
+
+def read_session_cookies(path) -> dict:
+    """TikTok's cookies from a Netscape cookies.txt, as name -> value.
+
+    tiktak §100: the owner's logged-in session, sent only by monitors whose
+    watch-list row says `cookies`. Returns {} when there is no usable file, and
+    the caller then stays anonymous.
+    """
+    if not path:
+        return {}
+    jar = http.cookiejar.MozillaCookieJar(path)
+    try:
+        jar.load(ignore_discard=True, ignore_expires=True)
+    except (OSError, http.cookiejar.LoadError):
+        return {}
+    return {c.name: c.value for c in jar if c.domain.endswith("tiktok.com")}
 
 
 def read_telegram_config():

@@ -85,6 +85,9 @@ class WatchEntry:
 
     username: str
     interval_min: int | None = None
+    # tiktak §100: a `cookies` token after the username — this monitor polls with
+    # the owner's session (age-restricted lives). Absent means anonymous.
+    session: bool = False
 
 
 # A poll interval this long is certainly a bug in whatever wrote the file rather
@@ -143,6 +146,7 @@ def read_watchlist_entries(path) -> list[WatchEntry]:
             WatchEntry(
                 username=username,
                 interval_min=_parse_interval(parts[1]) if len(parts) > 1 else None,
+                session="cookies" in parts[1:],
             )
         )
     return entries
