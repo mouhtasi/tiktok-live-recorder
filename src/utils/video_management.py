@@ -27,6 +27,13 @@ class VideoManagement:
         """
         Convert the video from flv format to mp4 format
         """
+        # 🚨 §104: wait_for_file_release() opens with mode "ab", which CREATES a
+        # missing file. After tiktak's ingest adopted a capture mid-recording that
+        # made a 0-byte stub here, and ffmpeg then failed with "moov atom not found".
+        if not os.path.exists(file):
+            logger.warning(f"{file} no longer exists — nothing to convert.")
+            return
+
         logger.info("Converting {} to MP4 format...".format(file))
 
         if not VideoManagement.wait_for_file_release(file):

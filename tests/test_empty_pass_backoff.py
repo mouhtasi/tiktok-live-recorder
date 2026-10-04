@@ -187,8 +187,9 @@ def test_a_403_with_a_body_is_an_empty_pass_and_writes_nothing_to_the_capture(tm
     assert sleeps == [2, 4, 8]
     assert "HTTP 403" in _pass_lines(lines)[0]
     assert response.close.called
-    [capture] = tmp_path.glob("TK_tester_*_flv.mp4")
-    assert capture.read_bytes() == b""                        # no error page in the FLV
+    # No error page reached the FLV: the capture holds 0 bytes, so the recorder
+    # removed it (§104) instead of converting it.
+    assert list(tmp_path.glob("TK_tester_*_flv.mp4")) == []
 
 
 def test_a_force_stop_during_an_empty_run_ends_it_after_one_pass(tmp_path):

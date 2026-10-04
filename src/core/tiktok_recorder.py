@@ -89,6 +89,13 @@ class TikTokRecorder:
     EMPTY_PASS_BACKOFF_CAP_S = 30
     # One log line for the first empty pass of a run, then every Nth.
     EMPTY_PASS_LOG_EVERY = 10
+    # §104 — this much continuous silence ends the recording. A bound far above any
+    # normal tail (the longest measured, 2026-10-01, was 348 s). Without it a room
+    # whose room/info stays "live" holds its capture forever with a healthy
+    # watchdog promise, and tiktak's sweep cannot take it: a 0-byte capture is "not
+    # FLV" to it. It is NOT a pause detector — a stream that resumes sooner is
+    # recorded into the same file.
+    SILENCE_FLOOR_S = 15 * 60
 
     def _promise(self, seconds: float) -> None:
         """Publish "I will act again within `seconds`" for the supervisor.
@@ -99,6 +106,27 @@ class TikTokRecorder:
         deadline = getattr(self, "_deadline", None)
         if deadline is not None:
             deadline.value = time.time() + seconds
+
+    @staticmethod
+    def _room_sidecar_path(output: str) -> Path:
+        """`TK_<user>_<ts>_flv.mp4` → `TK_<user>_<ts>.room.json`."""
+        return Path(output.replace("_flv.mp4", ".room.json"))
+
+    @staticmethod
+    def _capture_taken(output: str, out_file) -> bool:
+        """True when `output` no longer names the file this monitor holds open.
+
+        tiktak's ingest sweep treats a capture with no write for 300 s as an
+        orphan, remuxes it and unlinks (or renames) it. During a broadcast's last
+        minutes — TikTok still says "live", the stream gives nothing — a healthy
+        monitor looks exactly like that. Had the stream resumed, every later byte
+        would have gone to the unlinked file. An open handle keeps its inode from
+        being recycled, so a path that names a different inode is a different file.
+        """
+        try:
+            return os.stat(output).st_ino != os.fstat(out_file.fileno()).st_ino
+        except OSError:
+            return True
 
     def _pause_after_empty_pass(self, seconds: float) -> None:
         """Wait out an empty pass, but wake at once for a force-stop."""
@@ -524,7 +552,7 @@ class TikTokRecorder:
         if isinstance(created, bool) or not isinstance(created, int) or created <= 0:
             created = None
         joined = int(time.time())
-        sidecar = Path(output.replace("_flv.mp4", ".room.json"))
+        sidecar = self._room_sidecar_path(output)
         tmp = sidecar.with_name(sidecar.name + ".tmp")
         try:
             tmp.write_text(json.dumps({
@@ -568,9 +596,17 @@ class TikTokRecorder:
         logger.info("[PRESS CTRL + C ONCE TO STOP]")
         with open(output, "wb") as out_file:
             stop_recording = False
+            adopted = False
             empty_run = 0
+            last_bytes_at = time.monotonic()
             while not stop_recording:
                 self._promise(self.STALL_BUDGET_S)
+                # Before any request, so a monitor in a long backoff notices the
+                # sweep taking its capture without spending one more.
+                if self._capture_taken(output, out_file):
+                    logger.warning(self._adopted_message(output, 0))
+                    adopted = True
+                    break
                 pass_started = time.monotonic()
                 pass_bytes = 0
                 pass_error = None
@@ -588,6 +624,14 @@ class TikTokRecorder:
                         pass_bytes += len(chunk)
                         buffer.extend(chunk)
                         if len(buffer) >= buffer_size:
+                            if self._capture_taken(output, out_file):
+                                # The buffer is lost with the old file: it has no
+                                # FLV header, so it cannot start the next one.
+                                logger.warning(self._adopted_message(output, len(buffer)))
+                                buffer.clear()
+                                adopted = True
+                                stop_recording = True
+                                break
                             out_file.write(buffer)
                             buffer.clear()
                             # Bytes are arriving: this monitor is working (§94).
@@ -638,8 +682,15 @@ class TikTokRecorder:
 
                 finally:
                     if buffer:
-                        out_file.write(buffer)
-                        buffer.clear()
+                        if self._capture_taken(output, out_file):
+                            # Same loss as at a flush: report what was measured.
+                            logger.warning(self._adopted_message(output, len(buffer)))
+                            buffer.clear()
+                            adopted = True
+                            stop_recording = True
+                        else:
+                            out_file.write(buffer)
+                            buffer.clear()
                     out_file.flush()
 
                 # §104 — every pass that did not break out above ends here,
@@ -660,11 +711,22 @@ class TikTokRecorder:
                         "now and converting what we have."
                     )
                     stop_recording = True
+                if pass_bytes:
+                    last_bytes_at = time.monotonic()
                 if not pass_bytes and not stop_recording:
                     self._pause_after_empty_pass(min(
                         self.EMPTY_PASS_BACKOFF_START_S * 2 ** min(empty_run - 1, 5),
                         self.EMPTY_PASS_BACKOFF_CAP_S,
                     ))
+                    silent_for = time.monotonic() - last_bytes_at
+                    if silent_for >= self.SILENCE_FLOOR_S:
+                        logger.warning(
+                            f"@{user}: the stream has been silent for "
+                            f"{silent_for / 60:.0f} min while the room still reads "
+                            "live — ending this recording. The monitor polls again "
+                            "at once."
+                        )
+                        break
 
         # A force-stop is one-shot: it ends *this* recording. If the user is
         # still in the watch-list, the monitor keeps polling — without this the
@@ -673,8 +735,41 @@ class TikTokRecorder:
             self._stop_now_event.clear()
 
         logger.info(f"Recording finished: {Path(output).resolve()}\n")
+        if adopted:
+            return  # already warned; the sweep archived the file, nothing to convert
+        try:
+            # One call, not exists() then getsize(): the sweep can act between two.
+            size = os.path.getsize(output)
+        except OSError:
+            # With the pass-top check this means the sweep won a race in the last
+            # instants. 🚨 Do not call convert: open(path, "ab") re-creates the
+            # missing file as a 0-byte stub and ffmpeg then fails on it.
+            logger.warning(
+                f"Capture {Path(output).name} was already adopted by ingest — "
+                "nothing left to convert."
+            )
+            return
+        if size == 0:
+            logger.info(
+                f"Capture {Path(output).name} holds no bytes — removing it and "
+                "its room sidecar instead of converting."
+            )
+            for stub in (Path(output), self._room_sidecar_path(output)):
+                try:
+                    stub.unlink()
+                except OSError:
+                    pass
+            return
         self._promise(self.CONVERT_BUDGET_S)
         VideoManagement.convert_flv_to_mp4(output, self.bitrate, self.ffmpeg_path)
+
+    @staticmethod
+    def _adopted_message(output: str, lost_bytes: int) -> str:
+        return (
+            f"Capture {Path(output).name} was adopted while open (tiktak ingest "
+            f"took it) — ending this recording; {lost_bytes} buffered bytes are "
+            "lost with it. A new file starts on the next poll."
+        )
 
     def check_country_blacklisted(self):
         is_blacklisted = self.tiktok.is_country_blacklisted()
