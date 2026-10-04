@@ -83,6 +83,12 @@ class TikTokRecorder:
     # How often a waiting monitor re-reads its own interval: the hot tier, so a
     # re-tier to hot costs at most one hot poll of delay.
     RETIER_CHECK_S = 5 * 60
+    # §104 — pause after a stream pass that ended with zero bytes: 2, 4, 8, 16,
+    # then 30 s. A pass that wrote bytes reconnects at once and resets it.
+    EMPTY_PASS_BACKOFF_START_S = 2
+    EMPTY_PASS_BACKOFF_CAP_S = 30
+    # One log line for the first empty pass of a run, then every Nth.
+    EMPTY_PASS_LOG_EVERY = 10
 
     def _promise(self, seconds: float) -> None:
         """Publish "I will act again within `seconds`" for the supervisor.
@@ -93,6 +99,36 @@ class TikTokRecorder:
         deadline = getattr(self, "_deadline", None)
         if deadline is not None:
             deadline.value = time.time() + seconds
+
+    def _pause_after_empty_pass(self, seconds: float) -> None:
+        """Wait out an empty pass, but wake at once for a force-stop."""
+        event = self._stop_now_event
+        if event is not None:
+            event.wait(seconds)
+        else:
+            time.sleep(seconds)
+
+    def _report_pass(
+        self, pass_bytes: int, seconds: float, empty_run: int, error: str | None = None
+    ) -> None:
+        """One line per stream pass: bytes, seconds, HTTP status, Content-Length.
+
+        🚨 §104: a pass that ends cleanly with no bytes used to log nothing, so a
+        recording's tail of ~100 empty passes (5.8 min on 2026-10-01) was
+        invisible. Passes with bytes always log; an empty run logs its first pass
+        and every Nth, so a long one cannot flood the log.
+        """
+        if pass_bytes == 0 and empty_run != 1 and empty_run % self.EMPTY_PASS_LOG_EVERY:
+            return
+        status = getattr(self.tiktok, "last_stream_status", None)
+        length = getattr(self.tiktok, "last_stream_length", None)
+        run = f", {empty_run} empty passes in a row" if empty_run > 1 else ""
+        raised = f", ended by {error}" if error else ""
+        logger.info(
+            f"Stream pass ended: {pass_bytes} bytes in {seconds:.1f}s "
+            f"(HTTP {status}, Content-Length {length if length is not None else 'unknown'}"
+            f"{run}{raised})"
+        )
 
     def should_stop(self) -> bool:
         """Retire this monitor at the next poll boundary (never mid-recording)."""
@@ -532,8 +568,16 @@ class TikTokRecorder:
         logger.info("[PRESS CTRL + C ONCE TO STOP]")
         with open(output, "wb") as out_file:
             stop_recording = False
+            empty_run = 0
             while not stop_recording:
                 self._promise(self.STALL_BUDGET_S)
+                pass_started = time.monotonic()
+                pass_bytes = 0
+                pass_error = None
+                # The status belongs to THIS pass. Left over from the last one, a
+                # connect that fails would be reported as "HTTP 200".
+                self.tiktok.last_stream_status = None
+                self.tiktok.last_stream_length = None
                 try:
                     if not self.tiktok.is_room_alive(room_id):
                         logger.info("User is no longer live. Stopping recording.")
@@ -541,6 +585,7 @@ class TikTokRecorder:
 
                     start_time = time.time()
                     for chunk in self.tiktok.download_live_stream(live_url):
+                        pass_bytes += len(chunk)
                         buffer.extend(chunk)
                         if len(buffer) >= buffer_size:
                             out_file.write(buffer)
@@ -567,20 +612,24 @@ class TikTokRecorder:
                             stop_recording = True
                             break
 
-                except ConnectionError:
+                except ConnectionError as ex:
+                    pass_error = type(ex).__name__
                     if self.mode == Mode.AUTOMATIC:
                         logger.error(Error.CONNECTION_CLOSED_AUTOMATIC)
                         time.sleep(TimeOut.CONNECTION_CLOSED * TimeOut.ONE_MINUTE)
 
                 except (RequestException, HTTPException) as ex:
+                    pass_error = type(ex).__name__
                     logger.warning(f"Network hiccup, retrying: {ex}")
                     time.sleep(2)
 
                 except KeyboardInterrupt:
+                    pass_error = "KeyboardInterrupt"
                     logger.info("Recording stopped by user.")
                     stop_recording = True
 
                 except Exception as ex:
+                    pass_error = type(ex).__name__
                     logger.error(
                         f"Unexpected error during recording: {ex}",
                         exc_info=True,
@@ -592,6 +641,30 @@ class TikTokRecorder:
                         out_file.write(buffer)
                         buffer.clear()
                     out_file.flush()
+
+                # §104 — every pass that did not break out above ends here,
+                # clean or raised. Prod runs Mode.MANUAL (no `-mode` on the
+                # command line), where the builtin-ConnectionError handler is
+                # silent and sleeps nothing, so a pass that raises must reach
+                # the report and the backoff too or it can spin unseen.
+                empty_run = 0 if pass_bytes else empty_run + 1
+                self._report_pass(
+                    pass_bytes, time.monotonic() - pass_started, empty_run, pass_error
+                )
+                # The chunk loop is the only other place a force-stop is read, so
+                # an empty run never saw it — and the event's wait() returns at
+                # once when set, which would turn the backoff back into a spin.
+                if not stop_recording and self.should_stop_now():
+                    logger.info(
+                        f"Stop requested for @{user} — ending the recording "
+                        "now and converting what we have."
+                    )
+                    stop_recording = True
+                if not pass_bytes and not stop_recording:
+                    self._pause_after_empty_pass(min(
+                        self.EMPTY_PASS_BACKOFF_START_S * 2 ** min(empty_run - 1, 5),
+                        self.EMPTY_PASS_BACKOFF_CAP_S,
+                    ))
 
         # A force-stop is one-shot: it ends *this* recording. If the user is
         # still in the watch-list, the monitor keeps polling — without this the

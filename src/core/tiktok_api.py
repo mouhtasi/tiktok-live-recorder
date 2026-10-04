@@ -523,6 +523,10 @@ class TikTokAPI:
     # bytes, not the length of the broadcast.
     STREAM_TIMEOUT = (10, 60)
 
+    # Set by each download_live_stream() call (§104); None before the first.
+    last_stream_status = None
+    last_stream_length = None
+
     def download_live_stream(self, live_url: str):
         """Generator that returns the live stream for a given room_id.
 
@@ -536,6 +540,18 @@ class TikTokAPI:
         stream = self._http_client_stream.get(
             live_url, stream=True, timeout=self.STREAM_TIMEOUT
         )
+        # §104: what the CDN answered, for start_recording()'s one-line pass
+        # report. A pass that ends with nothing otherwise says nothing about why.
+        self.last_stream_status = getattr(stream, "status_code", None)
+        self.last_stream_length = (getattr(stream, "headers", None) or {}).get(
+            "Content-Length"
+        )
+        # An error PAGE is not stream. iter_content() yields its body whatever the
+        # status, and a body would count as bytes: no backoff, and HTML appended to
+        # the FLV. Treat 4xx/5xx as an empty pass — the log line carries the status.
+        if isinstance(self.last_stream_status, int) and self.last_stream_status >= 400:
+            stream.close()
+            return
         for chunk in stream.iter_content(chunk_size=4096):
             if chunk:
                 yield chunk
