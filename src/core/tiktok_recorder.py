@@ -582,6 +582,17 @@ class TikTokRecorder:
         if not live_url:
             raise LiveNotFound(TikTokError.RETRIEVE_LIVE_URL)
 
+        # Every FLV the room offers, best first; `live_url` is the first. A
+        # hand-built test double has no list here, and then there is one stream.
+        streams = getattr(self.tiktok, "last_stream_candidates", None)
+        if not isinstance(streams, list) or not streams:
+            streams = [("stream", live_url)]
+        stream_index = 0
+        logger.info(
+            f"Streams on offer for @{user}: "
+            + ", ".join(label for label, _ in streams)
+        )
+
         output = self._build_output_path(user)
         self._write_room_sidecar(output, room_id)
 
@@ -599,6 +610,8 @@ class TikTokRecorder:
             adopted = False
             empty_run = 0
             last_bytes_at = time.monotonic()
+            received_any = False
+            paused_at = None
             while not stop_recording:
                 self._promise(self.STALL_BUDGET_S)
                 # Before any request, so a monitor in a long backoff notices the
@@ -616,8 +629,33 @@ class TikTokRecorder:
                 self.tiktok.last_stream_length = None
                 try:
                     if not self.tiktok.is_room_alive(room_id):
-                        logger.info("User is no longer live. Stopping recording.")
-                        break
+                        status = getattr(self.tiktok, "last_room_status", None)
+                        if status != TikTokAPI.ROOM_PAUSED:
+                            # The value is named because it was not on
+                            # 2026-10-05, when a recording ended in the middle
+                            # of a broadcast and nothing said which status did it.
+                            shown = status if isinstance(status, int) else "unknown"
+                            logger.info(
+                                f"User is no longer live (room status {shown}). "
+                                "Stopping recording."
+                            )
+                            break
+                        # A pause is not an end. The file stays open and the
+                        # stream is asked as usual: while it gives nothing, the
+                        # §104 backoff paces the asking and the silence floor
+                        # bounds it.
+                        if paused_at is None:
+                            paused_at = time.monotonic()
+                            logger.info(
+                                f"@{user} paused the broadcast (room status 3) — "
+                                "keeping the recording open."
+                            )
+                    elif paused_at is not None:
+                        logger.info(
+                            f"@{user} resumed after "
+                            f"{time.monotonic() - paused_at:.0f} s."
+                        )
+                        paused_at = None
 
                     start_time = time.time()
                     for chunk in self.tiktok.download_live_stream(live_url):
@@ -713,6 +751,23 @@ class TikTokRecorder:
                     stop_recording = True
                 if pass_bytes:
                     last_bytes_at = time.monotonic()
+                    received_any = True
+                # 🚨 Only while the capture is empty. A reconnect to the same URL
+                # appends a second FLV of the same rendition, which the remux
+                # copes with; another rendition could change the codec in the
+                # middle of the file.
+                if (
+                    not pass_bytes
+                    and not received_any
+                    and not stop_recording
+                    and len(streams) > 1
+                ):
+                    stream_index = (stream_index + 1) % len(streams)
+                    label, live_url = streams[stream_index]
+                    logger.info(
+                        f"@{user}: no data yet — trying stream "
+                        f"{stream_index + 1}/{len(streams)} ({label})."
+                    )
                 if not pass_bytes and not stop_recording:
                     self._pause_after_empty_pass(min(
                         self.EMPTY_PASS_BACKOFF_START_S * 2 ** min(empty_run - 1, 5),

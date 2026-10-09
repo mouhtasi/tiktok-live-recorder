@@ -114,6 +114,15 @@ class TikTokAPI:
 
         return data["data"][0].get("alive", False)
 
+    # room/info's `status`. 3 is from upstream #463: the creator paused the
+    # broadcast and the room is still open. is_room_alive() answers False for
+    # it — a pause must not START a recording — and keeps the value in
+    # `last_room_status`, so the recording loop can tell a pause from an end and
+    # hold its file open (tests/test_paused_room.py).
+    ROOM_LIVE = 2
+    ROOM_PAUSED = 3
+    last_room_status = None
+
     def is_room_alive(self, room_id: str) -> bool:
         """Return True only if the room is CURRENTLY broadcasting.
 
@@ -134,6 +143,9 @@ class TikTokAPI:
         if not room_id:
             raise UserLiveError(TikTokError.USER_NOT_CURRENTLY_LIVE)
 
+        # Cleared first: a raise or a WAF answer must never leave the status of
+        # the call before in place for the recording loop to read.
+        self.last_room_status = None
         data = self._get(
             f"{self.WEBCAST_URL}/webcast/room/info/?aid=1988&room_id={room_id}",
             "webcast/room/info",
@@ -142,7 +154,8 @@ class TikTokAPI:
         if data.get("status_code") == 4003110:  # WAF block — no status available
             return self._check_alive_flag(room_id)
 
-        return (data.get("data") or {}).get("status") == 2
+        self.last_room_status = (data.get("data") or {}).get("status")
+        return self.last_room_status == self.ROOM_LIVE
 
     def get_sec_uid(self):
         """
@@ -452,8 +465,15 @@ class TikTokAPI:
         seconds, or None) so the recorder can say how late it joined — see
         tests/test_room_sidecar.py. Cleared first, so a response without it can
         never leave the previous broadcast's start in place.
+
+        The URL returned is the first of `last_stream_candidates`: every FLV the
+        answer offers as (label, url), best level first and `main` before
+        `backup`. The recording loop moves down that list when a stream gives
+        nothing (tests/test_stream_candidates.py). FLV only — ingest knows no
+        other capture — and never the audio-only entry.
         """
         self.last_room_created_at = None
+        self.last_stream_candidates = []
         data = self._get(
             f"{self.WEBCAST_URL}/webcast/room/info/?aid=1988&room_id={room_id}",
             "webcast/room/info",
@@ -472,6 +492,7 @@ class TikTokAPI:
                 )
                 fallback_url = self._get_stream_url_from_page(user)
                 if fallback_url:
+                    self._add_stream_candidate("live page", fallback_url)
                     return fallback_url
 
             raise UserLiveError(TikTokError.LIVE_RESTRICTION)
@@ -487,13 +508,14 @@ class TikTokAPI:
             logger.warning(
                 "No SDK stream data found. Falling back to legacy URLs. Consider contacting the developer to update the code."
             )
-            return (
-                stream_url.get("flv_pull_url", {}).get("FULL_HD1")
-                or stream_url.get("flv_pull_url", {}).get("HD1")
-                or stream_url.get("flv_pull_url", {}).get("SD2")
-                or stream_url.get("flv_pull_url", {}).get("SD1")
-                or stream_url.get("rtmp_pull_url", "")
-            )
+            for key in ("FULL_HD1", "HD1", "SD2", "SD1"):
+                self._add_stream_candidate(
+                    key, stream_url.get("flv_pull_url", {}).get(key)
+                )
+            self._add_stream_candidate("rtmp", stream_url.get("rtmp_pull_url"))
+            if self.last_stream_candidates:
+                return self.last_stream_candidates[0][1]
+            return ""
 
         # Extract stream options
         sdk_data = json.loads(sdk_data_str).get("data", {})
@@ -507,17 +529,33 @@ class TikTokAPI:
             logger.warning("No qualities found in the stream data. Returning None.")
             return None
         level_map = {q["sdk_key"]: q["level"] for q in qualities}
+        names = {q["sdk_key"]: q.get("name") or q["sdk_key"] for q in qualities}
 
-        best_level = -1
-        best_flv = None
-        for sdk_key, entry in sdk_data.items():
-            level = level_map.get(sdk_key, -1)
-            stream_main = entry.get("main", {})
-            if level > best_level:
-                best_level = level
-                best_flv = stream_main.get("flv")
+        # Best level first; the sort is stable, so a tie keeps the answer's own
+        # order, as the single pick did. An entry with no level is left out, as
+        # it always was: `ao` is the audio-only stream.
+        for sdk_key in sorted(
+            (key for key in sdk_data if key in level_map),
+            key=lambda key: level_map[key],
+            reverse=True,
+        ):
+            for role in ("main", "backup"):
+                self._add_stream_candidate(
+                    f"{names[sdk_key]} {role}",
+                    (sdk_data[sdk_key].get(role) or {}).get("flv"),
+                )
 
-        return best_flv
+        if self.last_stream_candidates:
+            return self.last_stream_candidates[0][1]
+        return None
+
+    # Set by each get_live_url() call; empty before the first.
+    last_stream_candidates = ()
+
+    def _add_stream_candidate(self, label: str, url) -> None:
+        """Keep a stream URL once, in the order offered."""
+        if url and all(url != known for _, known in self.last_stream_candidates):
+            self.last_stream_candidates.append((label, url))
 
     # (connect, read). The read timeout is the longest silence between two
     # bytes, not the length of the broadcast.
