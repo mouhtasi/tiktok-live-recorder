@@ -7,6 +7,27 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 PROC_TITLE_PREFIX = "tiktok-live-recorder"
 
+# Imported by the forkserver before any monitor is forked (tiktak §56).
+FORKSERVER_PRELOAD = "utils.forkserver_preload"
+
+
+def _preload_forkserver(logger):
+    """Have the forkserver import the recorder once, for every monitor to share.
+
+    Must run before the first Process.start(), which is what launches the
+    forkserver; a preload set after that is silently ignored. Under any other
+    start method (fork on Python < 3.14, spawn on macOS) there is no forkserver
+    and this does nothing — the monitors then behave exactly as before.
+    """
+    method = multiprocessing.get_start_method()
+    if method != "forkserver":
+        logger.info(f"Start method is {method}; no forkserver preload")
+        return False
+    # The call replaces the list; '__main__' is the stdlib's default entry.
+    multiprocessing.set_forkserver_preload(["__main__", FORKSERVER_PRELOAD])
+    logger.info(f"Forkserver preloads {FORKSERVER_PRELOAD}")
+    return True
+
 
 def record_user(config):
     from core.tiktok_recorder import TikTokRecorder
@@ -81,6 +102,8 @@ def run_supervised(args, mode, cookies):
 
     from core.supervisor import RecorderSupervisor
     from utils.logger_manager import logger
+
+    _preload_forkserver(logger)
 
     reload_event = threading.Event()
 
