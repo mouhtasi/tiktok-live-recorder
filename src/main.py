@@ -29,7 +29,41 @@ def _preload_forkserver(logger):
     return True
 
 
+def _die_with_parent():
+    """End this monitor when main.py dies.
+
+    🚨 If main.py is killed (a cgroup cap kill can pick it; tiktak 2026-10-21),
+    its monitors keep recording, and tiktak's watchdog starts a new recorder
+    beside them: two monitors per account. A thread waits on the parent's
+    sentinel, which multiprocessing closes when main.py exits, and then
+    SIGTERMs this process. Monitors have no SIGTERM handler, so that ends them
+    as a unit restart does; the cut capture stays a raw `_flv` for tiktak's
+    ingest sweep. A parent already gone wakes the thread at once.
+
+    Not PR_SET_PDEATHSIG: measured on prod the same day, it never fires. A
+    monitor's OS parent is the forkserver, and the forkserver hands its alive
+    pipe to every child, so it outlives main.py while any monitor lives.
+    tiktak also ends the old process group before a heal; this is the second
+    layer.
+    """
+    import signal
+    import threading
+    from multiprocessing.connection import wait
+
+    parent = multiprocessing.parent_process()
+    if parent is None:
+        return
+
+    def watch():
+        wait([parent.sentinel])
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    threading.Thread(target=watch, name="parent-watch", daemon=True).start()
+
+
 def record_user(config):
+    _die_with_parent()
+
     from core.tiktok_recorder import TikTokRecorder
     from utils.logger_manager import logger, use_worker_log_file
 
