@@ -43,3 +43,11 @@ class RecorderConfig:
     # this monitor promises to act again. The supervisor ends a live worker that
     # is past it — the only way to see a monitor that is alive but stuck.
     deadline: object | None = None
+    # tiktak §140: a shared RawArray("d", 3) — polls in a row with no clean
+    # answer, the wall time of the first, and a reason code (BLIND_REASONS). The
+    # only way to see a monitor that is alive, on time, and answered by nothing.
+    blind: object | None = None
+    # tiktak §140: a multiprocessing.Array("d", 2) shared by EVERY monitor —
+    # [window start, session retries in it] — the fleet-wide cap on sending the
+    # owner's session for login-required lives. None: no fleet cap.
+    fleet_session: object | None = None

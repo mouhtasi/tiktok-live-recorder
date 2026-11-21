@@ -94,6 +94,17 @@ class WatchEntry:
 # than an instruction: a day between liveness polls would miss every broadcast.
 _MAX_INTERVAL_MIN = 24 * 60
 
+# tiktak §140 — why a monitor's last poll got no clean answer. The monitor
+# stores the code in its shared `blind` array; the health file carries the name.
+# One map for both sides, so a renumbering cannot drift between them.
+BLIND_WAF, BLIND_LOGIN_REQUIRED, BLIND_ERROR, BLIND_NO_ANSWER = 1, 2, 3, 4
+BLIND_REASONS = {
+    BLIND_WAF: "waf",
+    BLIND_LOGIN_REQUIRED: "login_required",
+    BLIND_ERROR: "error",
+    BLIND_NO_ANSWER: "no_answer",
+}
+
 
 def _parse_interval(token: str) -> int | None:
     """A row's interval, or None if it does not state a usable one.
@@ -519,6 +530,26 @@ class RecorderSupervisor:
 
     # ── telemetry ─────────────────────────────────────────────────────────────
 
+    def _blind_monitors(self) -> list[dict]:
+        """Live monitors whose recent polls got no clean answer (tiktak §140).
+
+        On 2026-11-20 five monitors were 403'd for up to 21 hours while every
+        other field here read healthy: alive, on time, logging. A handle without
+        `blind_state` (an older monitor, a test fake) is skipped, never guessed.
+        """
+        out = []
+        for user, worker in self.workers.items():
+            state_of = getattr(worker, "blind_state", None)
+            if state_of is None or not worker.is_alive():
+                continue
+            try:
+                state = state_of()
+            except Exception:
+                continue
+            if state:
+                out.append({"user": user, **state})
+        return sorted(out, key=lambda s: s["since"])
+
     def _write_health(self, result: ReconcileResult, desired: list[str]) -> None:
         """Publish supervision state for tiktak's status endpoint.
 
@@ -547,6 +578,7 @@ class RecorderSupervisor:
                 "queued": len(result.queued),
                 "stuck_total": self._stuck_total,
                 "stuck_recent": self._stuck_recent,
+                "blind": self._blind_monitors(),
             }
             tmp = self.health_path.with_suffix(".tmp")
             tmp.write_text(json.dumps(payload))

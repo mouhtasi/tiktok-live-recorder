@@ -2,13 +2,16 @@ import json
 import os
 import random
 import time
+import zlib
 from http.client import HTTPException
 from pathlib import Path
 from threading import Thread
 
 from requests import RequestException
 
-from core.supervisor import read_watchlist_entries
+from core.supervisor import (
+    BLIND_ERROR, BLIND_LOGIN_REQUIRED, BLIND_NO_ANSWER, BLIND_WAF, read_watchlist_entries,
+)
 from core.tiktok_api import TikTokAPI
 from utils.logger_manager import logger
 from utils.recorder_config import RecorderConfig
@@ -31,6 +34,14 @@ from utils.enums import Mode, Error, TimeOut, TikTokError
 # and 🚨 a missed live is unrecoverable, so the spread is bounded by how long the
 # recorder may stay blind rather than by the interval. Five minutes still thins
 # 94 cold accounts to one request every ~3.2s, which is far inside budget.
+#
+# 🚨 tiktak §140 (2026-11-20): it was not inside budget for long. Every later
+# poll inherited the stagger's phase, so the whole 20-minute tier (145 monitors)
+# stayed inside 5 of its 20 minutes for as long as the recorder ran, and TikTok
+# 403'd 15–28 % of the lookups there — the same few accounts, poll after poll,
+# for up to 21 hours. The limit is a rate over minutes, not a burst over seconds.
+# The stagger now only spreads the FIRST poll; every later poll waits for the
+# account's own wall-clock slot (_recheck_delay_s), which covers the interval.
 INITIAL_POLL_JITTER_MAX_S = 300
 
 
@@ -70,6 +81,8 @@ class TikTokRecorder:
         self._stop_event = config.stop_event
         self._stop_now_event = config.stop_now_event
         self._deadline = getattr(config, "deadline", None)
+        self._blind = getattr(config, "blind", None)
+        self._fleet_session = getattr(config, "fleet_session", None)
 
     # §94 — how long each kind of work may take before the supervisor may call
     # this monitor stuck. Generous on purpose: ending a working monitor costs a
@@ -83,6 +96,20 @@ class TikTokRecorder:
     # How often a waiting monitor re-reads its own interval: the hot tier, so a
     # re-tier to hot costs at most one hot poll of delay.
     RETIER_CHECK_S = 5 * 60
+    # §140 — the shortest wait to the next slot, so an account never polls twice
+    # in quick succession (a quarter of the interval for very short tiers).
+    SLOT_GAP_MAX_S = 60
+    # §140 — after this many session retries in a row that found nothing to
+    # record, no retry for the cooldown, so a false "login required" on an
+    # offline account cannot send the owner's session on every poll. A real
+    # login-required live records on the first retry and never counts.
+    SESSION_RETRY_STRIKES = 3
+    SESSION_RETRY_COOLDOWN_S = 3600
+    # ...and across ALL monitors at most this many retries per window. Real
+    # login-required lives came from 3 accounts in 14 days; six in ten minutes
+    # covers several at once and caps an event that hits every monitor.
+    FLEET_SESSION_RETRY_BUDGET = 6
+    FLEET_SESSION_RETRY_WINDOW_S = 600
     # §104 — pause after a stream pass that ended with zero bytes: 2, 4, 8, 16,
     # then 30 s. A pass that wrote bytes reconnects at once and resets it.
     EMPTY_PASS_BACKOFF_START_S = 2
@@ -274,7 +301,48 @@ class TikTokRecorder:
                 return
             if self._stop_event.wait(min(seconds - elapsed, self.RETIER_CHECK_S)):
                 return
-            seconds = min(seconds, self._poll_interval_minutes() * TimeOut.ONE_MINUTE)
+            # 🚨 Cut only a wait longer than any slot wait of the current tier
+            # (§140). A slot wait runs up to interval + gap; cut to the bare
+            # interval it would end just before the slot, the next slot would
+            # then be under `gap` away, and the account would poll twice a
+            # minute apart, every cycle. A re-tier to a shorter interval still
+            # cuts the wait to that interval, as §94 needs. That poll lands off
+            # the new tier's slot, so the next wait can be as short as the gap
+            # (60 s): one early extra poll per re-tier, accepted to keep §94's
+            # "a promotion to hot polls within five minutes".
+            interval_s = self._poll_interval_minutes() * TimeOut.ONE_MINUTE
+            if seconds > interval_s + self._slot_gap_s(interval_s):
+                seconds = interval_s
+
+    def _slot_offset_s(self, interval_s: float) -> float:
+        """Where inside each interval this account polls (§140).
+
+        crc32 of the username, not hash(): hash() is salted per process, so its
+        slot would move at every restart. The same name gives the same offset in
+        every process, so a restart re-forms no herd.
+        """
+        return zlib.crc32(self.user.encode("utf-8")) / 2**32 * interval_s
+
+    def _slot_gap_s(self, interval_s: float) -> float:
+        return min(self.SLOT_GAP_MAX_S, interval_s / 4)
+
+    def _recheck_delay_s(self, interval_min: float) -> float:
+        """Seconds until this account's next poll slot, at least one gap away.
+
+        tiktak §140. The old wait was the bare interval, so each cycle lasted the
+        interval plus the poll's own time: the phases drifted, and they kept
+        whatever bunching the start-up stagger left. A wall-clock slot ignores
+        both. Result is in [gap, interval + gap). An unsupervised run has no herd
+        and keeps the plain interval.
+        """
+        interval_s = interval_min * TimeOut.ONE_MINUTE
+        if self.watchlist_path is None:
+            return interval_s
+        gap = self._slot_gap_s(interval_s)
+        delay = (self._slot_offset_s(interval_s) - time.time()) % interval_s
+        if delay < gap:
+            delay += interval_s
+        return delay
 
     def _setup(self):
         """Resolve user/room data and validate prerequisites via network calls."""
@@ -362,13 +430,208 @@ class TikTokRecorder:
 
         self.start_recording(self.user, self.room_id)
 
+    def _record_if_live(self):
+        """One poll's check-and-record, retried once with the owner's session if
+        the live needs a login (tiktak §140).
+
+        §100's `cookies` flag is set by a human, and nothing told one to: from
+        2026-11-15 one watched account's lives answered "Live is private, login
+        required" and four were missed. Retrying only on that answer, only when
+        a session file is configured, keeps §100's rule that the owner's session
+        goes out for lives that need it and nothing else. The next poll's
+        _apply_session() puts the client back to what the row says.
+        """
+        try:
+            self.manual_mode()
+        except UserLiveError as ex:
+            restricted = bool(ex.args) and ex.args[0] is TikTokError.LIVE_RESTRICTION
+            if not restricted:
+                # "In a row" means in a row: any poll that reaches this check
+                # without a restriction ends the run of fruitless retries (review
+                # round 3 — three spread over weeks must not arm the cooldown
+                # before a real live). A poll whose room-id lookup is WAF-blocked
+                # never gets here and neither counts nor resets.
+                self._fruitless_session_retries = 0
+                raise
+            if not self._use_session_for_this_poll():
+                raise
+            try:
+                self.manual_mode()
+            except (UserLiveError, LiveNotFound) as again:
+                # 🚨 The session found nothing to record. LIVE_RESTRICTION is raised
+                # for any room/info 4003110 whose page has no stream, and that path
+                # decides liveness by check_alive, which §39 caught saying alive
+                # for ended rooms — so a restriction is not proof of a live. But
+                # a cooldown after ONE such retry cuts the start of a real live
+                # that begins inside it (review round 2), and over 14 days of
+                # logs "login required" fired only inside real lives. So: hold
+                # back only after several fruitless retries in a row. A strike is
+                # "not live" or the same wall again; a WAF block or a missing URL
+                # says nothing about whether the session is needed.
+                fruitless = isinstance(again, UserLiveError) and (
+                    self._is_not_live(again)
+                    or (again.args and again.args[0] is TikTokError.LIVE_RESTRICTION)
+                )
+                if fruitless:
+                    self._fruitless_session_retries = (
+                        getattr(self, "_fruitless_session_retries", 0) + 1
+                    )
+                if fruitless and self._fruitless_session_retries >= self.SESSION_RETRY_STRIKES:
+                    self._fruitless_session_retries = 0
+                    self._session_retry_after = (
+                        time.monotonic() + self.SESSION_RETRY_COOLDOWN_S
+                    )
+                    logger.warning(
+                        f"[!] @{self.user}: {self.SESSION_RETRY_STRIKES} session retries "
+                        "in a row found nothing to record — no session retry for "
+                        f"{self.SESSION_RETRY_COOLDOWN_S // 60} min"
+                    )
+                raise
+            self._fruitless_session_retries = 0
+        else:
+            self._fruitless_session_retries = 0
+
+    def _note_poll(self, ex) -> None:
+        """Publish how this poll ended, for the supervisor's health file (§140).
+
+        Clean (resets the run): a recording (`ex` None) or "not live". Anything
+        else extends the run of polls that could have missed a live. Never
+        raises: the measurement must not cost the poll.
+        """
+        blind = getattr(self, "_blind", None)
+        if blind is None:
+            return
+        if ex is not None and getattr(self, "_poll_found_live", False):
+            return  # this poll found and recorded a live; how it ended is not blindness
+        try:
+            code = self._blind_code(ex)
+            if code == 0:
+                blind[0], blind[1], blind[2] = 0, 0, 0   # polls first: a reader sees "clean"
+                return
+            # The count last: a reader that sees polls >= 1 must find its start
+            # and reason already written (the array has no lock).
+            if blind[0] < 1:
+                blind[1] = time.time()
+            blind[2] = code
+            blind[0] += 1
+        except Exception:
+            pass
+
+    @staticmethod
+    def _is_not_live(ex) -> bool:
+        """The clean "not live" answer: the enum from is_room_alive(), or
+        manual_mode()'s f-string around it."""
+        what = ex.args[0] if ex.args else ""
+        return str(TikTokError.USER_NOT_CURRENTLY_LIVE) in str(what)
+
+    @classmethod
+    def _blind_code(cls, ex) -> int:
+        """0 clean, else a BLIND_REASONS code."""
+        if ex is None:
+            return 0
+        if isinstance(ex, UserLiveError):
+            what = ex.args[0] if ex.args else ""
+            if what is TikTokError.WAF_BLOCKED:
+                return BLIND_WAF
+            if what is TikTokError.LIVE_RESTRICTION:
+                return BLIND_LOGIN_REQUIRED
+            if cls._is_not_live(ex):
+                return 0
+            return BLIND_NO_ANSWER
+        if isinstance(ex, LiveNotFound):
+            return BLIND_NO_ANSWER
+        return BLIND_ERROR
+
+    def _use_session_for_this_poll(self) -> bool:
+        """Switch to the owner's session for a login-required live; False if not possible."""
+        if self.watchlist_path is None or getattr(self, "_session_on", False):
+            return False
+        if time.monotonic() < getattr(self, "_session_retry_after", 0.0):
+            return False
+        # A fault here must not replace the poll's own answer (the login wall)
+        # with an "error", nor spend a unit of the fleet budget: build first,
+        # take the budget last.
+        try:
+            session = read_session_cookies(getattr(self, "_session_cookies_path", None))
+            if not session:
+                return False
+            cookies = dict(self._base_cookies or {})
+            cookies.update(session)
+            client = TikTokAPI(
+                proxy=self._proxy, cookies=cookies,
+                events_file=self._events_file, user=self.user,
+            )
+        except Exception as ex:
+            logger.error(f"@{self.user}: could not build the session client ({ex!r})")
+            return False
+        if not self._fleet_allows_session():
+            logger.warning(
+                f"[!] @{self.user}: login-required live, but the fleet's session "
+                f"budget ({self.FLEET_SESSION_RETRY_BUDGET} per "
+                f"{self.FLEET_SESSION_RETRY_WINDOW_S // 60} min) is spent — polling anonymously"
+            )
+            return False
+        self.tiktok = client
+        self._cookies = cookies
+        self._session_on = True
+        self._session_for_poll = True
+        logger.info(
+            f"@{self.user}: this live needs a login — retrying this poll with the "
+            "owner's session"
+        )
+        return True
+
+    def _fleet_allows_session(self) -> bool:
+        """Take one retry from the fleet-wide window, or False if it is spent.
+
+        Fails open: on a broken shared array the per-monitor strikes still bound
+        the session, and a guard fault must not cost a real live.
+        """
+        fleet = getattr(self, "_fleet_session", None)
+        if fleet is None:
+            return True
+        try:
+            with fleet.get_lock():
+                now = time.time()
+                if now - fleet[0] >= self.FLEET_SESSION_RETRY_WINDOW_S:
+                    fleet[0], fleet[1] = now, 0
+                if fleet[1] >= self.FLEET_SESSION_RETRY_BUDGET:
+                    return False
+                fleet[1] += 1
+                return True
+        except Exception:
+            return True
+
+    def _end_poll_session(self) -> None:
+        """Drop a session that _use_session_for_this_poll() turned on, at the
+        next poll boundary, whatever the watch-list says.
+
+        🚨 Not left to _apply_session(): that changes nothing on an unreadable
+        watch-list or an unlisted (retiring) user, so the owner's session would
+        stay on for poll after poll of an account whose row never said
+        `cookies`. A row that does say `cookies` turns it back on right after.
+        """
+        if not getattr(self, "_session_for_poll", False):
+            return
+        cookies = dict(self._base_cookies or {})
+        self.tiktok = TikTokAPI(
+            proxy=self._proxy, cookies=cookies,
+            events_file=self._events_file, user=self.user,
+        )
+        self._cookies = cookies
+        self._session_on = False
+        # Last: if building the client raised, the flag stays set and the next
+        # poll boundary tries again rather than keeping the session for good.
+        self._session_for_poll = False
+
     def _stagger_first_poll(self):
         """Wait a random fraction of this monitor's interval before polling.
 
-        Applied once, never per poll. Every later poll inherits the offset, so a
-        monitor that starts 137s late stays 137s out of step with its tier for
-        as long as it lives — the herd is broken up for one delay, paid once,
-        rather than latency added to every cycle forever.
+        Applied once, to the FIRST poll only. 🚨 §140: later polls do not
+        inherit this offset any more — each waits for the account's own
+        wall-clock slot (_recheck_delay_s). The stagger spans at most 5 minutes,
+        so a 20-minute tier that inherited it stayed inside one 5-minute band
+        for as long as the recorder ran, and TikTok 403'd its core.
 
         🚨 Only in supervised (watch-list) mode. A single-account CLI run has no
         herd, and making someone wait up to five minutes for
@@ -418,11 +681,13 @@ class TikTokRecorder:
 
         while not self.should_stop():
             self._promise(self.POLL_BUDGET_S)
+            self._poll_found_live = False
             try:
                 # 🚨 Its own guard: a fault in the session switch must cost
                 # the session, never the poll. Raised into the catch-all
                 # below, it would skip this poll and every one after it.
                 try:
+                    self._end_poll_session()
                     self._apply_session()
                 except Exception as ex:
                     logger.error(f"@{self.user}: session switch failed ({ex!r}) — polling as before")
@@ -437,13 +702,19 @@ class TikTokRecorder:
                 else:
                     self.room_id = self.tiktok.get_room_id_from_user(self.user)
 
-                self.manual_mode()
+                self._record_if_live()
+                self._note_poll(None)
+                self._error_streak = 0
 
             except (UserLiveError, LiveNotFound) as ex:
+                self._error_streak = 0
+                self._note_poll(ex)
                 logger.info(ex)
                 interval = self._poll_interval_minutes()
-                logger.info(f"Waiting {interval} minutes before recheck\n")
-                self._wait_for_next_poll(interval * TimeOut.ONE_MINUTE)
+                delay = self._recheck_delay_s(interval)
+                slot = f" (the {interval}-minute tier's slot)" if self.watchlist_path else ""
+                logger.info(f"Waiting {delay / 60:.1f} minutes before recheck{slot}\n")
+                self._wait_for_next_poll(delay)
 
             except Exception as ex:
                 # Any other error during the poll/record cycle is transient from
@@ -457,13 +728,27 @@ class TikTokRecorder:
                 # transport errors (the is_room_alive path uses curl_cffi, whose
                 # exceptions don't derive from requests.RequestException),
                 # JSON-decode errors, etc. Catch broadly, log, and retry.
+                self._note_poll(ex)
                 logger.error(
                     f"Recoverable error in automatic mode for @{self.user}, "
                     f"retrying after delay: {ex}"
                 )
+                # One quick retry for a transient fault; from the second error in
+                # a row, the account's own slot (§140), so a monitor whose polls
+                # keep failing does not poll every 2 minutes off its slot and put
+                # back the load the slots spread out.
+                # A fault at the end of a recording (remux, disk) is not a failing
+                # poll: the next check of a stream that may restart stays quick.
+                if getattr(self, "_poll_found_live", False):
+                    self._error_streak = 0
+                else:
+                    self._error_streak = getattr(self, "_error_streak", 0) + 1
                 delay = TimeOut.CONNECTION_CLOSED * TimeOut.ONE_MINUTE
-                self._promise(delay + self.POLL_BUDGET_S)
-                time.sleep(delay)
+                if self._error_streak >= 2:
+                    delay = self._recheck_delay_s(self._poll_interval_minutes())
+                # Interruptible (§37's stop must not wait it out); it promises
+                # the §94 deadline itself.
+                self._wait_for_next_poll(delay)
 
         logger.info(f"Monitor for @{self.user} stopping as requested.")
 
@@ -581,6 +866,13 @@ class TikTokRecorder:
         live_url = self.tiktok.get_live_url(room_id, user=user)
         if not live_url:
             raise LiveNotFound(TikTokError.RETRIEVE_LIVE_URL)
+        # §140: the live is found and about to be recorded, so this poll is
+        # clean now — not when the broadcast ends hours later, which would list
+        # an account being recorded as blind for its whole live. The flag keeps
+        # an error at the END of the recording (a remux, a disk fault) from
+        # opening a blind run for an account that was just recorded.
+        self._note_poll(None)
+        self._poll_found_live = True
 
         # Every FLV the room offers, best first; `live_url` is the first. A
         # hand-built test double has no list here, and then there is one stream.

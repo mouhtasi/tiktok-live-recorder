@@ -34,6 +34,12 @@ first one permanently de-phases the herd, because each subsequent poll inherits
 the offset: a monitor that starts 137s late stays 137s out of step with its
 tier for as long as it lives. One cost, paid once.
 
+🚨 tiktak §140 (2026-11-20) found the flaw in "inherits": the stagger spans at
+most 5 minutes, so a 20-minute tier inherited a 5-minute band and kept it, and
+the accounts in its core were 403'd poll after poll. Later polls now go to a
+fixed wall-clock slot per account (tests/test_poll_slots.py); this file only
+covers the first poll.
+
 ## The cap, and what it is protecting
 
 The wait is capped at 5 minutes even for a 60-minute account. Uncapped, a cold
@@ -140,12 +146,9 @@ def test_monitors_are_actually_de_phased(tmp_path):
     assert len(delays) > 15, f"offsets are not spread: {sorted(delays)}"
 
 
-def test_only_the_first_poll_is_delayed(tmp_path):
-    """The offset persists through later polls, so it is paid once.
-
-    Re-jittering every cycle would add latency forever and, worse, would let a
-    monitor drift back into phase with its tier.
-    """
+def test_only_the_first_poll_is_jittered(tmp_path):
+    """The random stagger is paid once; every later wait goes to the account's
+    fixed slot (§140), never a fresh random draw."""
     rec = _make_recorder(tmp_path, interval=5)
 
     waits = []
@@ -155,14 +158,17 @@ def test_only_the_first_poll_is_delayed(tmp_path):
         if len(waits) >= 4:
             raise _BreakLoop()
 
-    with patch.object(TikTokRecorder, "_wait_for_next_poll", side_effect=record):
-        with patch("core.tiktok_recorder.time.sleep", side_effect=record):
-            with pytest.raises(_BreakLoop):
-                rec.automatic_mode()
+    now = 1_763_700_000.0
+    with patch("core.tiktok_recorder.time.time", return_value=now):
+        with patch.object(TikTokRecorder, "_wait_for_next_poll", side_effect=record):
+            with patch("core.tiktok_recorder.time.sleep", side_effect=record):
+                with pytest.raises(_BreakLoop):
+                    rec.automatic_mode()
+        slot = rec._recheck_delay_s(5)
 
-    # First is the jitter; every later wait is the plain recheck interval.
-    assert waits[1] == 5 * 60
-    assert waits[2] == 5 * 60
+    # First is the jitter; every later wait is the slot wait (the clock is frozen).
+    assert waits[1] == slot
+    assert waits[2] == slot
 
 
 def test_an_unsupervised_run_is_not_delayed(tmp_path):

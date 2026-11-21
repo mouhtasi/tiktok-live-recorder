@@ -147,6 +147,12 @@ def run_supervised(args, mode, cookies):
 
     signal.signal(signal.SIGHUP, _on_sighup)
 
+    # tiktak §140: ONE budget for the owner's session across every monitor —
+    # [window start, retries in it], under its lock. Each monitor bounds its own
+    # retries, but an event that hit many at once (a WAF episode answering
+    # 4003110 everywhere) would otherwise send the session from all of them.
+    fleet_session = multiprocessing.Array("d", 2)
+
     def spawn(username, stagger=True):
         stop_event = multiprocessing.Event()
         stop_now_event = multiprocessing.Event()
@@ -159,12 +165,18 @@ def run_supervised(args, mode, cookies):
         # §94: 0.0 until the monitor makes its first promise.
         deadline = multiprocessing.Value("d", 0.0)
         config.deadline = deadline
+        # tiktak §140: [polls with no clean answer, wall time of the first, reason
+        # code]. Raw (no lock, no semaphore): one writer, and a torn read is
+        # corrected by the next health pass.
+        blind = multiprocessing.RawArray("d", 3)
+        config.blind = blind
+        config.fleet_session = fleet_session
 
         proc = multiprocessing.Process(
             target=record_user, args=(config,), name=f"{PROC_TITLE_PREFIX}[@{username}]"
         )
         proc.start()
-        return _Worker(username, proc, stop_event, stop_now_event, deadline)
+        return _Worker(username, proc, stop_event, stop_now_event, deadline, blind)
 
     supervisor = RecorderSupervisor(
         watchlist_path=args.watchlist,
@@ -196,15 +208,33 @@ class _Worker:
     that case only.
     """
 
-    def __init__(self, username, proc, stop_event, stop_now_event, deadline=None):
+    def __init__(self, username, proc, stop_event, stop_now_event, deadline=None,
+                 blind=None):
         self.username = username
         self.proc = proc
         self._stop_event = stop_event
         self._stop_now_event = stop_now_event
         self._deadline = deadline
+        self._blind = blind
 
     def is_alive(self):
         return self.proc.is_alive()
+
+    def blind_state(self):
+        """The monitor's run of polls with no clean answer (§140); None when it
+        is answering normally or reports nothing."""
+        from core.supervisor import BLIND_REASONS
+
+        if self._blind is None:
+            return None
+        polls, since, code = self._blind[0], self._blind[1], self._blind[2]
+        # No lock: a reset can land between these reads. Read the count again
+        # and drop a read that changed under us or has no start — the next
+        # health pass, a few seconds later, gets a whole one.
+        if polls < 1 or since <= 0 or self._blind[0] != polls:
+            return None
+        return {"polls": int(polls), "since": since,
+                "reason": BLIND_REASONS.get(int(code), "no_answer")}
 
     def seconds_overdue(self, now):
         """How far past its promised deadline the monitor is; None if it has
